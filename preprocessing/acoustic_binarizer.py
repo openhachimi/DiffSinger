@@ -39,6 +39,7 @@ ACOUSTIC_ITEM_ATTRIBUTES = [
     'languages',
     'tokens',
     'mel2ph',
+    'needs_alignment',
     'f0',
     'energy',
     'breathiness',
@@ -85,6 +86,11 @@ class AcousticBinarizer(BaseBinarizer):
                         f'Waveform file not found for item \'{item_name}\'. '
                         f'Candidate extensions: {WAV_CANDIDATE_EXTENSIONS}'
                     )
+                ph_dur_str = utterance_label['ph_dur'].strip()
+                if ph_dur_str.lower() == 'none':
+                    ph_dur = None
+                else:
+                    ph_dur = [float(x) for x in ph_dur_str.split()]
                 temp_dict = {
                     'wav_fn': str(wav_fn),
                     'spk_id': self.spk_map[spk],
@@ -98,13 +104,14 @@ class AcousticBinarizer(BaseBinarizer):
                         for p in utterance_label['ph_seq'].split()
                     ],
                     'ph_seq': self.phoneme_dictionary.encode(utterance_label['ph_seq'], lang=lang),
-                    'ph_dur': [float(x) for x in utterance_label['ph_dur'].split()],
+                    'ph_dur': ph_dur,
                     'ph_text': utterance_label['ph_seq'],
                 }
-                assert len(temp_dict['ph_seq']) == len(temp_dict['ph_dur']), \
-                    f'Lengths of ph_seq and ph_dur mismatch in \'{item_name}\'.'
-                assert all(ph_dur >= 0 for ph_dur in temp_dict['ph_dur']), \
-                    f'Negative ph_dur found in \'{item_name}\'.'
+                if ph_dur is not None:
+                    assert len(temp_dict['ph_seq']) == len(temp_dict['ph_dur']), \
+                        f'Lengths of ph_seq and ph_dur mismatch in \'{item_name}\'.'
+                    assert all(d >= 0 for d in temp_dict['ph_dur']), \
+                        f'Negative ph_dur found in \'{item_name}\'.'
                 meta_data_dict[f'{ds_id}:{item_name}'] = temp_dict
 
         return meta_data_dict
@@ -130,14 +137,20 @@ class AcousticBinarizer(BaseBinarizer):
             'mel': mel,
             'languages': np.array(meta_data['lang_seq'], dtype=np.int64),
             'tokens': np.array(meta_data['ph_seq'], dtype=np.int64),
-            'ph_dur': np.array(meta_data['ph_dur']).astype(np.float32),
             'ph_text': meta_data['ph_text'],
         }
 
-        # get ground truth dur
-        processed_input['mel2ph'] = get_mel2ph_torch(
-            self.lr, torch.from_numpy(processed_input['ph_dur']), length, self.timestep, device=self.device
-        ).cpu().numpy()
+        if meta_data['ph_dur'] is not None:
+            # Ground-truth durations available: compute mel2ph normally
+            ph_dur = np.array(meta_data['ph_dur'], dtype=np.float32)
+            processed_input['mel2ph'] = get_mel2ph_torch(
+                self.lr, torch.from_numpy(ph_dur), length, self.timestep, device=self.device
+            ).cpu().numpy()
+            processed_input['needs_alignment'] = np.bool_(False)
+        else:
+            # No duration annotation: alignment will be learned during training
+            processed_input['mel2ph'] = np.zeros(length, dtype=np.int64)
+            processed_input['needs_alignment'] = np.bool_(True)
 
         # get ground truth f0
         global pitch_extractor

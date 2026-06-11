@@ -36,6 +36,7 @@ class AcousticDataset(BaseDataset):
         self.need_speed = hparams['use_speed_embed']
         self.need_spk_id = hparams['use_spk_id']
         self.need_lang_id = hparams['use_lang_id']
+        self.use_alf = hparams.get('use_alf', False)
 
     def collater(self, samples):
         batch = super().collater(samples)
@@ -64,6 +65,12 @@ class AcousticDataset(BaseDataset):
         if self.need_lang_id:
             languages = utils.collate_nd([s['languages'] for s in samples], 0)
             batch['languages'] = languages
+        if self.use_alf:
+            # needs_alignment flag and actual mel lengths (needed for ALF prior computation)
+            batch['needs_alignment'] = torch.BoolTensor(
+                [bool(s.get('needs_alignment', False)) for s in samples]
+            )
+            batch['mel_lengths'] = torch.LongTensor([s['mel'].shape[0] for s in samples])
         return batch
 
 
@@ -78,6 +85,8 @@ class AcousticTask(BaseTask):
             self.shallow_args = hparams['shallow_diffusion_args']
             self.train_aux_decoder = self.shallow_args['train_aux_decoder']
             self.train_diffusion = self.shallow_args['train_diffusion']
+
+        self.use_alf = hparams.get('use_alf', False)
 
         self.use_vocoder = hparams['infer'] or hparams['val_with_vocoder']
         if self.use_vocoder:
@@ -115,6 +124,14 @@ class AcousticTask(BaseTask):
         else:
             raise ValueError(f"Unknown diffusion type: {self.diffusion_type}")
         self.register_validation_loss('mel_loss')
+        if self.use_alf:
+            from modules.alignment import AttentionCTCLoss, AttentionBinarizationLoss
+            self.alf_ctc_loss = AttentionCTCLoss()
+            self.alf_bin_loss = AttentionBinarizationLoss()
+            self.lambda_alf_ctc = hparams.get('lambda_alf_ctc', 1.0)
+            self.lambda_alf_bin = hparams.get('lambda_alf_bin', 1.0)
+            self.register_validation_loss('alf_ctc_loss')
+            self.register_validation_loss('alf_bin_loss')
 
     def run_model(self, sample, infer=False):
         txt_tokens = sample['tokens']  # [B, T_ph]
@@ -136,11 +153,17 @@ class AcousticTask(BaseTask):
             languages = sample['languages']
         else:
             languages = None
+
+        needs_alignment = sample.get('needs_alignment') if self.use_alf else None
+        mel_lengths = sample.get('mel_lengths') if self.use_alf else None
+
         output: ShallowDiffusionOutput = self.model(
             txt_tokens, mel2ph=mel2ph, f0=f0, **variances,
             key_shift=key_shift, speed=speed,
             spk_embed_id=spk_embed_id, languages=languages,
-            gt_mel=target, infer=infer
+            gt_mel=target, infer=infer,
+            needs_alignment=needs_alignment,
+            mel_lengths=mel_lengths,
         )
 
         if infer:
@@ -154,7 +177,22 @@ class AcousticTask(BaseTask):
                 aux_mel_loss = self.lambda_aux_mel_loss * self.aux_mel_loss(aux_out, norm_gt)
                 losses['aux_mel_loss'] = aux_mel_loss
 
-            non_padding = (mel2ph > 0).unsqueeze(-1).float()
+            # For mel loss, use ALF-derived mel2ph non-padding mask when available
+            if output.alf_out is not None:
+                _, _, _, token_lengths, mel_lens = output.alf_out
+                # Build non-padding mask from mel_lengths (ALF items have correct mel_lens)
+                B, T_mel = mel2ph.shape
+                mel_idx = torch.arange(T_mel, device=mel2ph.device)[None]  # [1, T_mel]
+                if needs_alignment is not None and needs_alignment.any():
+                    alf_mask = mel_idx < mel_lens[:, None]  # [B, T_mel] True for valid frames
+                    gt_mask = mel2ph > 0
+                    combined_mask = torch.where(needs_alignment[:, None], alf_mask, gt_mask)
+                    non_padding = combined_mask.unsqueeze(-1).float()
+                else:
+                    non_padding = (mel2ph > 0).unsqueeze(-1).float()
+            else:
+                non_padding = (mel2ph > 0).unsqueeze(-1).float()
+
             if output.diff_out is not None:
                 if self.diffusion_type == 'ddpm':
                     x_recon, x_noise = output.diff_out
@@ -165,6 +203,16 @@ class AcousticTask(BaseTask):
                 else:
                     raise ValueError(f"Unknown diffusion type: {self.diffusion_type}")
                 losses['mel_loss'] = mel_loss
+
+            # ALF losses (only when any item in the batch needed alignment)
+            if output.alf_out is not None and needs_alignment is not None and needs_alignment.any():
+                attn_softs, attn_hards, attn_logprobs, token_lengths, mel_lens = output.alf_out
+                alf_ctc = self.lambda_alf_ctc * self.alf_ctc_loss(
+                    attn_logprobs, token_lengths, mel_lens
+                )
+                alf_bin = self.lambda_alf_bin * self.alf_bin_loss(attn_hards, attn_softs)
+                losses['alf_ctc_loss'] = alf_ctc
+                losses['alf_bin_loss'] = alf_bin
 
             return losses
 
