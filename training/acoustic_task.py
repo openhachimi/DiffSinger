@@ -104,10 +104,32 @@ class AcousticTask(BaseTask):
         super()._finish_init()
 
     def _build_model(self):
+        alf_pad_token_id = None
+        if hparams.get('use_alf', False) and hparams.get('alf_use_interleaved_pad', False):
+            alf_pad_phoneme = hparams.get('alf_pad_phoneme', 'SP')
+            try:
+                alf_pad_token_id = self.phoneme_dictionary.encode_one(alf_pad_phoneme)
+            except Exception as e:
+                raise ValueError(
+                    f'Failed to encode ALF pad phoneme "{alf_pad_phoneme}". '
+                    f'Please set `alf_pad_phoneme` to a valid global phoneme tag.'
+                ) from e
         return DiffSingerAcoustic(
             vocab_size=len(self.phoneme_dictionary),
-            out_dims=hparams['audio_num_mel_bins']
+            out_dims=hparams['audio_num_mel_bins'],
+            alf_pad_token_id=alf_pad_token_id
         )
+
+    @staticmethod
+    def _expand_alf_ph_seq_for_plot(ph_seq):
+        if ph_seq is None:
+            return None
+        pad_symbol = hparams.get('alf_pad_phoneme', 'SP')
+        expanded = [pad_symbol]
+        for ph in ph_seq:
+            expanded.append(ph)
+            expanded.append(pad_symbol)
+        return expanded
 
     # noinspection PyAttributeOutsideInit
     def build_losses_and_metrics(self):
@@ -259,6 +281,8 @@ class AcousticTask(BaseTask):
                             ph_seq = None
                             if 'ph_texts' in self.valid_dataset.metadata:
                                 ph_seq = self.valid_dataset.metadata['ph_texts'][data_idx].split()
+                                if hparams.get('alf_use_interleaved_pad', False):
+                                    ph_seq = self._expand_alf_ph_seq_for_plot(ph_seq)
                             self.plot_alf(data_idx, soft, hard, ph_seq=ph_seq)
         return losses, sample['size']
 

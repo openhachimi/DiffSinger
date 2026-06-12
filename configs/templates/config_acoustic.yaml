@@ -53,6 +53,14 @@ use_tension_embed: false
 use_key_shift_embed: true
 use_speed_embed: true
 
+# Alignment Learning Framework (ALF)
+use_alf: false
+# Insert a pad phoneme between every phoneme (including head/tail) during ALF,
+# then convert alignment back to original no-pad phoneme sequence.
+alf_use_interleaved_pad: false
+# Global phoneme tag used as the inserted pad when alf_use_interleaved_pad=true.
+alf_pad_phoneme: SP
+
 augmentation_args:
   random_pitch_shifting:
     enabled: true
