@@ -176,6 +176,10 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
             start_positions = duration_start[real_mask]
             if start_positions.numel() == 0:
                 continue
+            start_positions = torch.cat([
+                start_positions.new_zeros([1], dtype=start_positions.dtype),
+                start_positions[1:]
+            ])
             end_positions = torch.cat([
                 start_positions[1:],
                 start_positions.new_tensor([feat_len], dtype=start_positions.dtype)
