@@ -37,7 +37,7 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
     def category(self):
         return 'acoustic'
 
-    def __init__(self, vocab_size, out_dims):
+    def __init__(self, vocab_size, out_dims, alf_pad_token_id=None):
         CategorizedModule.__init__(self)
         ParameterAdaptorModule.__init__(self)
         self.fs2 = FastSpeech2Acoustic(
@@ -97,6 +97,110 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
             )
             self._alf_prior_interpolator = BetaBinomialInterpolator()
             self._alf_lr = LengthRegulator()
+            self.alf_use_interleaved_pad = hparams.get('alf_use_interleaved_pad', False)
+            self.alf_pad_token_id = alf_pad_token_id
+            if self.alf_use_interleaved_pad and (self.alf_pad_token_id is None or self.alf_pad_token_id <= 0):
+                raise ValueError(
+                    'Invalid ALF pad token id. '
+                    'Please set a valid non-zero phoneme in `alf_pad_phoneme`.'
+                )
+
+    @staticmethod
+    def _expand_tokens_for_alf(txt_tokens, needs_alignment, pad_token_id, languages=None):
+        batch_tokens = []
+        batch_languages = [] if languages is not None else None
+        batch_maps = []
+        batch_lengths = []
+        batch_size = txt_tokens.shape[0]
+        device = txt_tokens.device
+        for b in range(batch_size):
+            token_row = txt_tokens[b]
+            valid_mask = token_row > 0
+            valid_tokens = token_row[valid_mask]
+            token_count = valid_tokens.shape[0]
+            if needs_alignment[b].item() and token_count > 0:
+                expanded_len = token_count * 2 + 1
+                expanded_tokens = token_row.new_full((expanded_len,), pad_token_id)
+                expanded_tokens[1::2] = valid_tokens
+                expanded_map = token_row.new_zeros((expanded_len,))
+                expanded_map[1::2] = torch.arange(1, token_count + 1, device=device, dtype=token_row.dtype)
+                if languages is not None:
+                    language_row = languages[b]
+                    valid_languages = language_row[valid_mask]
+                    expanded_languages = language_row.new_zeros((expanded_len,))
+                    expanded_languages[1::2] = valid_languages
+            else:
+                expanded_len = token_count
+                expanded_tokens = valid_tokens
+                expanded_map = token_row.new_zeros((expanded_len,))
+                if token_count > 0:
+                    expanded_map[:] = torch.arange(1, token_count + 1, device=device, dtype=token_row.dtype)
+                if languages is not None:
+                    language_row = languages[b]
+                    expanded_languages = language_row[valid_mask]
+            batch_tokens.append(expanded_tokens)
+            batch_maps.append(expanded_map)
+            if languages is not None:
+                batch_languages.append(expanded_languages)
+            batch_lengths.append(expanded_len)
+        max_len = max(batch_lengths)
+        expanded_tokens = txt_tokens.new_zeros((batch_size, max_len))
+        expanded_maps = txt_tokens.new_zeros((batch_size, max_len))
+        expanded_lengths = txt_tokens.new_tensor(batch_lengths, dtype=torch.long)
+        if languages is not None:
+            expanded_languages = languages.new_zeros((batch_size, max_len))
+        else:
+            expanded_languages = None
+        for b in range(batch_size):
+            row_len = batch_lengths[b]
+            if row_len > 0:
+                expanded_tokens[b, :row_len] = batch_tokens[b]
+                expanded_maps[b, :row_len] = batch_maps[b]
+                if expanded_languages is not None:
+                    expanded_languages[b, :row_len] = batch_languages[b]
+        return expanded_tokens, expanded_languages, expanded_maps, expanded_lengths
+
+    def _recover_no_pad_mel2ph(self, durations, token_maps, feature_lengths, max_mel_len):
+        batch_size = durations.shape[0]
+        mel2ph = durations.new_zeros((batch_size, max_mel_len))
+        for b in range(batch_size):
+            feat_len = int(feature_lengths[b].item())
+            if feat_len <= 0:
+                continue
+            duration_row = durations[b]
+            token_map_row = token_maps[b]
+            real_mask = token_map_row > 0
+            if not real_mask.any():
+                continue
+            duration_start = torch.cumsum(duration_row, dim=0) - duration_row
+            start_positions = duration_start[real_mask]
+            if start_positions.numel() == 0:
+                continue
+            start_positions = torch.cat([
+                start_positions.new_zeros([1], dtype=start_positions.dtype),
+                start_positions[1:]
+            ])
+            end_positions = torch.cat([
+                start_positions[1:],
+                start_positions.new_tensor([feat_len], dtype=start_positions.dtype)
+            ])
+            phoneme_dur = (end_positions - start_positions).clamp_min(0)
+            mel2ph_item = self._alf_lr(phoneme_dur[None].long())[0]
+            if mel2ph_item.shape[0] < feat_len:
+                mel2ph_item = F.pad(mel2ph_item, [0, feat_len - mel2ph_item.shape[0]])
+            mel2ph[b, :feat_len] = mel2ph_item[:feat_len]
+        return mel2ph
+
+    @staticmethod
+    def _recover_no_pad_encoder_out(encoder_out, token_maps, target_len):
+        batch_size, _, hidden_size = encoder_out.shape
+        encoder_out_no_pad = encoder_out.new_zeros((batch_size, target_len, hidden_size))
+        for b in range(batch_size):
+            real_mask = token_maps[b] > 0
+            token_count = int(real_mask.sum().item())
+            if token_count > 0:
+                encoder_out_no_pad[b, :token_count] = encoder_out[b, real_mask][:token_count]
+        return encoder_out_no_pad
 
     def _compute_attn_priors(self, mel_lengths, token_lengths, max_mel_len, max_token_len, device):
         """Compute beta-binomial attention priors for the batch."""
@@ -129,8 +233,15 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
             and needs_alignment.any()
             and gt_mel is not None
         ):
-            # Compute per-item token lengths (non-padding tokens)
-            token_lengths = (txt_tokens != 0).sum(dim=1)  # [B]
+            token_maps = None
+            if self.alf_use_interleaved_pad:
+                txt_tokens_alf, languages_alf, token_maps, token_lengths = self._expand_tokens_for_alf(
+                    txt_tokens, needs_alignment, self.alf_pad_token_id, languages=languages
+                )
+            else:
+                txt_tokens_alf = txt_tokens
+                languages_alf = languages
+                token_lengths = (txt_tokens_alf != 0).sum(dim=1)  # [B]
 
             if mel_lengths is None:
                 # Fall back to counting non-zero mel2ph entries (works for GT items;
@@ -142,14 +253,26 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
             #   GT items  → use GT mel2ph to compute dur (preserves dur conditioning)
             #   ALF items → use zero dur (alignment will be learned)
             dur_gt = mel2ph_to_dur(mel2ph, txt_tokens.shape[1]).float()
-            dur = dur_gt * (~needs_alignment[:, None]).float()
+            if self.alf_use_interleaved_pad:
+                dur = txt_tokens_alf.new_zeros(txt_tokens_alf.shape, dtype=torch.float)
+                non_alf_mask = ~needs_alignment
+                if non_alf_mask.any():
+                    dur[non_alf_mask, :dur_gt.shape[1]] = dur_gt[non_alf_mask]
+            else:
+                dur = dur_gt * (~needs_alignment[:, None]).float()
 
             # Single encoder pass
-            encoder_out = self.fs2.forward_encoder(txt_tokens, languages=languages, dur=dur)
+            encoder_out = self.fs2.forward_encoder(txt_tokens_alf, languages=languages_alf, dur=dur)
+            if self.alf_use_interleaved_pad:
+                encoder_out_for_gather = self._recover_no_pad_encoder_out(
+                    encoder_out, token_maps, txt_tokens.shape[1]
+                )
+            else:
+                encoder_out_for_gather = encoder_out
 
             # Compute beta-binomial attention priors
             max_mel_len = gt_mel.shape[1]
-            max_token_len = txt_tokens.shape[1]
+            max_token_len = txt_tokens_alf.shape[1]
             attn_priors = self._compute_attn_priors(
                 mel_lengths, token_lengths, max_mel_len, max_token_len, txt_tokens.device
             )
@@ -165,6 +288,10 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
 
             # Convert hard-alignment durations to mel2ph
             mel2ph_alf = self._alf_lr(durations.long())  # [B, T_mel_alf]
+            if self.alf_use_interleaved_pad:
+                mel2ph_alf = self._recover_no_pad_mel2ph(
+                    durations.long(), token_maps, mel_lengths, max_mel_len
+                )
 
             # Pad/crop to match gt_mel length
             if mel2ph_alf.shape[1] < max_mel_len:
@@ -177,7 +304,7 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
 
             # Gather condition from shared encoder_out
             condition = self.fs2.forward_gather(
-                encoder_out, mel2ph, f0,
+                encoder_out_for_gather, mel2ph, f0,
                 key_shift=key_shift, speed=speed,
                 spk_embed_id=spk_embed_id, **kwargs
             )
