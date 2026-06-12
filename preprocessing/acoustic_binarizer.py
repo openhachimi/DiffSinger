@@ -60,6 +60,16 @@ tension_smooth: SinusoidalSmoothingConv1d = None
 class AcousticBinarizer(BaseBinarizer):
     def __init__(self):
         super().__init__(data_attrs=ACOUSTIC_ITEM_ATTRIBUTES)
+        self.force_alf_alignment_by_spk = {}
+        for dataset in self.datasets:
+            spk = dataset['speaker']
+            force_alf_alignment = bool(dataset.get('force_alf_alignment', False))
+            if spk in self.force_alf_alignment_by_spk and \
+                    self.force_alf_alignment_by_spk[spk] != force_alf_alignment:
+                raise ValueError(
+                    f'Inconsistent force_alf_alignment settings for speaker \'{spk}\'.'
+                )
+            self.force_alf_alignment_by_spk[spk] = force_alf_alignment
         self.lr = LengthRegulator()
         self.need_energy = hparams['use_energy_embed']
         self.need_breathiness = hparams['use_breathiness_embed']
@@ -95,6 +105,7 @@ class AcousticBinarizer(BaseBinarizer):
                     'wav_fn': str(wav_fn),
                     'spk_id': self.spk_map[spk],
                     'spk_name': spk,
+                    'force_alf_alignment': self.force_alf_alignment_by_spk.get(spk, False),
                     'lang_seq': [
                         (
                             self.lang_map[lang if '/' not in p else p.split('/', maxsplit=1)[0]]
@@ -140,7 +151,8 @@ class AcousticBinarizer(BaseBinarizer):
             'ph_text': meta_data['ph_text'],
         }
 
-        if meta_data['ph_dur'] is not None:
+        force_alf_alignment = bool(meta_data.get('force_alf_alignment', False)) and hparams.get('use_alf', False)
+        if meta_data['ph_dur'] is not None and not force_alf_alignment:
             # Ground-truth durations available: compute mel2ph normally
             ph_dur = np.array(meta_data['ph_dur'], dtype=np.float32)
             processed_input['mel2ph'] = get_mel2ph_torch(

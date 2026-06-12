@@ -135,6 +135,7 @@ frozen_params: []
 
 # Alignment Learning Framework (ALF)
 # Set to true to enable automatic phoneme alignment for items with ph_dur=none in transcriptions.csv
+# You can also set datasets[].force_alf_alignment=true to force ALF for a speaker even if ph_dur is provided.
 use_alf: false
 # Insert a pad phoneme between every phoneme (including head/tail) during ALF,
 # then convert alignment back to original no-pad phoneme sequence.

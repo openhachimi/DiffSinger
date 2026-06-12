@@ -10,6 +10,7 @@ datasets:
   - raw_data_dir: data/xxx1/raw
     speaker: speaker1
     spk_id: 0
+    force_alf_alignment: false  # optional; force ALF alignment for this speaker even when ph_dur is provided
     language: zh
     test_prefixes:
       - wav1
@@ -20,6 +21,7 @@ datasets:
   - raw_data_dir: data/xxx2/raw
     speaker: speaker2
     spk_id: 1
+    force_alf_alignment: false
     language: zh
     test_prefixes:
       - wav1
