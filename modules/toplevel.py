@@ -18,15 +18,18 @@ from modules.core import (
 )
 from modules.fastspeech.acoustic_encoder import FastSpeech2Acoustic
 from modules.fastspeech.param_adaptor import ParameterAdaptorModule
-from modules.fastspeech.tts_modules import RhythmRegulator, LengthRegulator
+from modules.fastspeech.tts_modules import RhythmRegulator, LengthRegulator, mel2ph_to_dur
 from modules.fastspeech.variance_encoder import FastSpeech2Variance, MelodyEncoder
 from utils.hparams import hparams
 
 
 class ShallowDiffusionOutput:
-    def __init__(self, *, aux_out=None, diff_out=None):
+    def __init__(self, *, aux_out=None, diff_out=None, alf_out=None):
         self.aux_out = aux_out
         self.diff_out = diff_out
+        # alf_out: (attn_softs, attn_hards, attn_logprobs, token_lengths, mel_lengths)
+        # or None when ALF is not used
+        self.alf_out = alf_out
 
 
 class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
@@ -81,15 +84,112 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
         else:
             raise NotImplementedError(self.diffusion_type)
 
+        # Alignment Learning Framework (ALF) for training without duration annotations
+        self.use_alf = hparams.get('use_alf', False)
+        if self.use_alf:
+            from modules.alignment import (
+                Alignment_Learning_Framework,
+                BetaBinomialInterpolator,
+            )
+            self.alf = Alignment_Learning_Framework(
+                feature_size=hparams['audio_num_mel_bins'],
+                encoding_size=hparams['hidden_size']
+            )
+            self._alf_prior_interpolator = BetaBinomialInterpolator()
+            self._alf_lr = LengthRegulator()
+
+    def _compute_attn_priors(self, mel_lengths, token_lengths, max_mel_len, max_token_len, device):
+        """Compute beta-binomial attention priors for the batch."""
+        B = mel_lengths.shape[0]
+        priors = torch.zeros(B, max_mel_len, max_token_len, device=device)
+        for b in range(B):
+            m_len = mel_lengths[b].item()
+            t_len = token_lengths[b].item()
+            if m_len > 0 and t_len > 0:
+                prior = self._alf_prior_interpolator(m_len, t_len)  # [m_len, t_len]
+                priors[b, :m_len, :t_len] = torch.from_numpy(prior).to(device)
+        return priors  # [B, T_mel, T_text]
+
     def forward(
             self, txt_tokens, mel2ph, f0, key_shift=None, speed=None,
-            spk_embed_id=None, languages=None, gt_mel=None, infer=True, **kwargs
+            spk_embed_id=None, languages=None, gt_mel=None, infer=True,
+            needs_alignment=None, mel_lengths=None, **kwargs
     ) -> ShallowDiffusionOutput:
-        condition = self.fs2(
-            txt_tokens, mel2ph, f0, key_shift=key_shift, speed=speed,
-            spk_embed_id=spk_embed_id, languages=languages,
-            **kwargs
-        )
+        """
+        Args:
+            needs_alignment: [B] bool tensor; True for items that need ALF-based alignment
+            mel_lengths: [B] int tensor; actual mel frame counts (required when needs_alignment is set)
+        """
+        alf_out = None
+
+        # Use ALF when there are items without duration annotations (training or validation)
+        if (
+            self.use_alf
+            and needs_alignment is not None
+            and needs_alignment.any()
+            and gt_mel is not None
+        ):
+            # Compute per-item token lengths (non-padding tokens)
+            token_lengths = (txt_tokens != 0).sum(dim=1)  # [B]
+
+            if mel_lengths is None:
+                # Fall back to counting non-zero mel2ph entries (works for GT items;
+                # for ALF items mel2ph is placeholder zeros, but mel_lengths must be passed)
+                mel_lengths = (mel2ph > 0).sum(dim=1)
+                mel_lengths = torch.clamp(mel_lengths, min=1)
+
+            # Compute dur for the encoder:
+            #   GT items  → use GT mel2ph to compute dur (preserves dur conditioning)
+            #   ALF items → use zero dur (alignment will be learned)
+            dur_gt = mel2ph_to_dur(mel2ph, txt_tokens.shape[1]).float()
+            dur = dur_gt * (~needs_alignment[:, None]).float()
+
+            # Single encoder pass
+            encoder_out = self.fs2.forward_encoder(txt_tokens, languages=languages, dur=dur)
+
+            # Compute beta-binomial attention priors
+            max_mel_len = gt_mel.shape[1]
+            max_token_len = txt_tokens.shape[1]
+            attn_priors = self._compute_attn_priors(
+                mel_lengths, token_lengths, max_mel_len, max_token_len, txt_tokens.device
+            )
+
+            # Run ALF: obtain soft/hard alignments
+            durations, attn_softs, attn_hards, attn_logprobs = self.alf(
+                token_embeddings=encoder_out.transpose(1, 2),  # [B, H, T_text]
+                encoding_lengths=token_lengths,
+                features=gt_mel.transpose(1, 2),               # [B, n_mel, T_mel]
+                feature_lengths=mel_lengths,
+                attention_priors=attn_priors
+            )
+
+            # Convert hard-alignment durations to mel2ph
+            mel2ph_alf = self._alf_lr(durations.long())  # [B, T_mel_alf]
+
+            # Pad/crop to match gt_mel length
+            if mel2ph_alf.shape[1] < max_mel_len:
+                mel2ph_alf = F.pad(mel2ph_alf, [0, max_mel_len - mel2ph_alf.shape[1]])
+            else:
+                mel2ph_alf = mel2ph_alf[:, :max_mel_len]
+
+            # Replace mel2ph only for ALF items (keep GT mel2ph for annotated items)
+            mel2ph = torch.where(needs_alignment[:, None], mel2ph_alf, mel2ph)
+
+            # Gather condition from shared encoder_out
+            condition = self.fs2.forward_gather(
+                encoder_out, mel2ph, f0,
+                key_shift=key_shift, speed=speed,
+                spk_embed_id=spk_embed_id, **kwargs
+            )
+
+            alf_out = (attn_softs, attn_hards, attn_logprobs, token_lengths, mel_lengths)
+        else:
+            condition = self.fs2(
+                txt_tokens, mel2ph, f0, key_shift=key_shift, speed=speed,
+                spk_embed_id=spk_embed_id, languages=languages,
+                **kwargs
+            )
+
         if infer:
             if self.use_shallow_diffusion:
                 aux_mel_pred = self.aux_decoder(condition, infer=True)
@@ -114,12 +214,12 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
                     diff_out = self.diffusion(condition, gt_spec=gt_mel, infer=False)
                 else:
                     diff_out = None
-                return ShallowDiffusionOutput(aux_out=aux_out, diff_out=diff_out)
+                return ShallowDiffusionOutput(aux_out=aux_out, diff_out=diff_out, alf_out=alf_out)
 
             else:
                 aux_out = None
                 diff_out = self.diffusion(condition, gt_spec=gt_mel, infer=False)
-                return ShallowDiffusionOutput(aux_out=aux_out, diff_out=diff_out)
+                return ShallowDiffusionOutput(aux_out=aux_out, diff_out=diff_out, alf_out=alf_out)
 
 
 class DiffSingerVariance(CategorizedModule, ParameterAdaptorModule):

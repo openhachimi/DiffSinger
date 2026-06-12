@@ -132,3 +132,10 @@ finetune_strict_shapes: true
 
 freezing_enabled: false
 frozen_params: []
+
+# Alignment Learning Framework (ALF)
+# Set to true to enable automatic phoneme alignment for items with ph_dur=none in transcriptions.csv
+use_alf: false
+# Loss weights for the ALF CTC and binarization losses
+lambda_alf_ctc: 1.0
+lambda_alf_bin: 1.0

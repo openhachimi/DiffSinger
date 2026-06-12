@@ -79,22 +79,39 @@ class FastSpeech2Acoustic(nn.Module):
 
         return condition
 
-    def forward(
-            self, txt_tokens, mel2ph, f0,
-            key_shift=None, speed=None,
-            spk_embed_id=None, languages=None,
-            **kwargs
-    ):
+    def forward_encoder(self, txt_tokens, languages=None, dur=None):
+        """Run the text encoder and return encoder_out before gathering.
+
+        Args:
+            txt_tokens: [B, T_ph] token indices
+            languages: [B, T_ph] language IDs (optional)
+            dur: [B, T_ph] float durations for dur_embed (zeros if None)
+        Returns:
+            encoder_out: [B, T_ph, H]
+        """
         txt_embed = self.txt_embed(txt_tokens)
-        dur = mel2ph_to_dur(mel2ph, txt_tokens.shape[1]).float()
+        if dur is None:
+            dur = txt_tokens.new_zeros(txt_tokens.shape, dtype=torch.float)
         dur_embed = self.dur_embed(dur[:, :, None])
-        if self.use_lang_id:
+        if self.use_lang_id and languages is not None:
             lang_embed = self.lang_embed(languages)
             extra_embed = dur_embed + lang_embed
         else:
             extra_embed = dur_embed
         encoder_out = self.encoder(txt_embed, extra_embed, txt_tokens == 0)
+        return encoder_out
 
+    def forward_gather(self, encoder_out, mel2ph, f0, key_shift=None, speed=None,
+                       spk_embed_id=None, **kwargs):
+        """Gather condition from encoder_out using mel2ph, then add pitch/spk/variance embeds.
+
+        Args:
+            encoder_out: [B, T_ph, H] from forward_encoder
+            mel2ph: [B, T_mel] alignment indices
+            f0: [B, T_mel] F0 values
+        Returns:
+            condition: [B, T_mel, H]
+        """
         encoder_out = F.pad(encoder_out, [0, 0, 1, 0])
         mel2ph_ = mel2ph[..., None].repeat([1, 1, encoder_out.shape[-1]])
         condition = torch.gather(encoder_out, 1, mel2ph_)
@@ -114,5 +131,18 @@ class FastSpeech2Acoustic(nn.Module):
         condition = self.forward_variance_embedding(
             condition, key_shift=key_shift, speed=speed, **kwargs
         )
-
         return condition
+
+    def forward(
+            self, txt_tokens, mel2ph, f0,
+            key_shift=None, speed=None,
+            spk_embed_id=None, languages=None,
+            **kwargs
+    ):
+        dur = mel2ph_to_dur(mel2ph, txt_tokens.shape[1]).float()
+        encoder_out = self.forward_encoder(txt_tokens, languages=languages, dur=dur)
+        return self.forward_gather(
+            encoder_out, mel2ph, f0,
+            key_shift=key_shift, speed=speed,
+            spk_embed_id=spk_embed_id, **kwargs
+        )
