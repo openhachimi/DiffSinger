@@ -106,6 +106,36 @@ def curve_to_figure(curve_gt, curve_pred=None, curve_base=None, grid=None, title
     return fig
 
 
+def alf_to_figure(attn_soft, attn_hard, ph_seq=None, title=None):
+    """Visualize ALF (Alignment Learning Framework) alignment as a heatmap.
+
+    Args:
+        attn_soft (np.ndarray): [T_mel, T_text] soft attention weights
+        attn_hard (np.ndarray): [T_mel, T_text] hard (binarized) attention weights
+        ph_seq (list[str]): phoneme labels for the y-axis ticks
+        title (str): figure title
+    """
+    if isinstance(attn_soft, torch.Tensor):
+        attn_soft = attn_soft.cpu().numpy()
+    if isinstance(attn_hard, torch.Tensor):
+        attn_hard = attn_hard.cpu().numpy()
+    T_mel, T_text = attn_soft.shape
+    fig, axes = plt.subplots(1, 2, figsize=(max(8, T_mel // 10), max(4, T_text // 2)))
+    for ax, data, label in zip(axes, [attn_soft, attn_hard], ['soft', 'hard']):
+        # imshow expects [rows=y, cols=x]; plot transposed so x=time, y=phoneme
+        ax.imshow(data.T, origin='lower', aspect='auto', interpolation='nearest', cmap='viridis')
+        ax.set_xlabel('Duration (frames)')
+        ax.set_ylabel('Phoneme')
+        ax.set_title(label)
+        if ph_seq is not None:
+            ax.set_yticks(np.arange(T_text))
+            ax.set_yticklabels(ph_seq[:T_text], fontsize=8)
+    if title is not None:
+        fig.suptitle(title, fontsize=12)
+    plt.tight_layout()
+    return fig
+
+
 def distribution_to_figure(title, x_label, y_label, items: list, values: list, zoom=0.8, rotate=False):
     fig = plt.figure(figsize=(int(len(items) * zoom), 10))
     plt.bar(x=items, height=values)

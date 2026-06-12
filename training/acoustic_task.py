@@ -14,7 +14,7 @@ from modules.losses import DiffusionLoss, RectifiedFlowLoss
 from modules.toplevel import DiffSingerAcoustic, ShallowDiffusionOutput
 from modules.vocoders.registry import get_vocoder_cls
 from utils.hparams import hparams
-from utils.plot import spec_to_figure
+from utils.plot import spec_to_figure, alf_to_figure
 
 matplotlib.use('Agg')
 
@@ -133,7 +133,7 @@ class AcousticTask(BaseTask):
             self.register_validation_loss('alf_ctc_loss')
             self.register_validation_loss('alf_bin_loss')
 
-    def run_model(self, sample, infer=False):
+    def run_model(self, sample, infer=False, return_output=False):
         txt_tokens = sample['tokens']  # [B, T_ph]
         target = sample['mel']  # [B, T_s, M]
         mel2ph = sample['mel2ph']  # [B, T_s]
@@ -214,6 +214,8 @@ class AcousticTask(BaseTask):
                 losses['alf_ctc_loss'] = alf_ctc
                 losses['alf_bin_loss'] = alf_bin
 
+            if return_output:
+                return losses, output
             return losses
 
     def on_train_start(self):
@@ -225,7 +227,7 @@ class AcousticTask(BaseTask):
             self.vocoder.to_device(self.device)
 
     def _validation_step(self, sample, batch_idx):
-        losses = self.run_model(sample, infer=False)
+        losses, non_infer_output = self.run_model(sample, infer=False, return_output=True)
         if sample['size'] > 0 and min(sample['indices']) < hparams['num_valid_plots']:
             mel_out: ShallowDiffusionOutput = self.run_model(sample, infer=True)
             for i in range(len(sample['indices'])):
@@ -242,6 +244,22 @@ class AcousticTask(BaseTask):
                         self.plot_mel(data_idx, sample['mel'][i], mel_out.aux_out[i], 'auxmel')
                     if mel_out.diff_out is not None:
                         self.plot_mel(data_idx, sample['mel'][i], mel_out.diff_out[i], 'diffmel')
+            # Visualize ALF alignments from the non-infer pass
+            if self.use_alf and non_infer_output.alf_out is not None:
+                attn_softs, attn_hards, _, token_lengths, mel_lengths = non_infer_output.alf_out
+                needs_alignment = sample.get('needs_alignment')
+                for i in range(len(sample['indices'])):
+                    data_idx = sample['indices'][i].item()
+                    if data_idx < hparams['num_valid_plots']:
+                        if needs_alignment is None or needs_alignment[i]:
+                            t_len = token_lengths[i].item()
+                            m_len = mel_lengths[i].item()
+                            soft = attn_softs[i, 0, :m_len, :t_len]
+                            hard = attn_hards[i, 0, :m_len, :t_len]
+                            ph_seq = None
+                            if 'ph_texts' in self.valid_dataset.metadata:
+                                ph_seq = self.valid_dataset.metadata['ph_texts'][data_idx].split()
+                            self.plot_alf(data_idx, soft, hard, ph_seq=ph_seq)
         return losses, sample['size']
 
     ############
@@ -288,3 +306,15 @@ class AcousticTask(BaseTask):
         self.logger.all_rank_experiment.add_figure(f'{name_prefix}_{data_idx}', spec_to_figure(
             spec_cat[:mel_len], vmin, vmax, title_text
         ), global_step=self.global_step)
+
+    def plot_alf(self, data_idx, attn_soft, attn_hard, ph_seq=None):
+        if isinstance(attn_soft, torch.Tensor):
+            attn_soft = attn_soft.detach().cpu().numpy()
+        if isinstance(attn_hard, torch.Tensor):
+            attn_hard = attn_hard.detach().cpu().numpy()
+        title_text = f"{self.valid_dataset.metadata['spk_names'][data_idx]} - {self.valid_dataset.metadata['names'][data_idx]}"
+        self.logger.all_rank_experiment.add_figure(
+            f'alf_{data_idx}',
+            alf_to_figure(attn_soft, attn_hard, ph_seq=ph_seq, title=title_text),
+            global_step=self.global_step
+        )
