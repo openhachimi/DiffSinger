@@ -10,6 +10,7 @@ datasets:
   - raw_data_dir: data/xxx1/raw
     speaker: speaker1
     spk_id: 0
+    force_alf_alignment: false  # optional; force ALF alignment for this speaker even when ph_dur is provided
     language: zh
     test_prefixes:
       - wav1
@@ -20,6 +21,7 @@ datasets:
   - raw_data_dir: data/xxx2/raw
     speaker: speaker2
     spk_id: 1
+    force_alf_alignment: false
     language: zh
     test_prefixes:
       - wav1
@@ -52,6 +54,14 @@ use_tension_embed: false
 
 use_key_shift_embed: true
 use_speed_embed: true
+
+# Alignment Learning Framework (ALF)
+use_alf: false
+# Insert a pad phoneme between every phoneme (including head/tail) during ALF,
+# then convert alignment back to original no-pad phoneme sequence.
+alf_use_interleaved_pad: false
+# Global phoneme tag used as the inserted pad when alf_use_interleaved_pad=true.
+alf_pad_phoneme: SP
 
 augmentation_args:
   random_pitch_shifting:

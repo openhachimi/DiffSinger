@@ -1,8 +1,11 @@
+import json
+
 import torch
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch import nn
 
-from lib.plot import spec_to_figure
+from lib.plot import spec_to_figure, alf_to_figure
+from modules.alignment import AttentionBinarizationLoss, AttentionCTCLoss
 from modules.decoder import ShallowDiffusionOutput
 from modules.losses import RectifiedFlowLoss
 from modules.toplevel import DiffSingerAcoustic
@@ -12,7 +15,16 @@ from .pl_module_base import BaseLightningModule
 
 class AcousticLightningModule(BaseLightningModule):
     def build_model(self) -> DiffSingerAcoustic:
-        return DiffSingerAcoustic(self.model_config)
+        alf_pad_token_id = None
+        if self.model_config.use_alf and self.model_config.alf_use_interleaved_pad:
+            with open(self.binary_data_dir / "ph_map.json", "r", encoding="utf8") as f:
+                ph_map = json.load(f)
+            alf_pad_token_id = ph_map.get(self.model_config.alf_pad_phoneme)
+            if alf_pad_token_id is None:
+                raise ValueError(
+                    f"model.alf_pad_phoneme='{self.model_config.alf_pad_phoneme}' is not found in ph_map.json."
+                )
+        return DiffSingerAcoustic(self.model_config, alf_pad_token_id=alf_pad_token_id)
 
     # noinspection PyAttributeOutsideInit
     def post_init(self) -> None:
@@ -28,6 +40,7 @@ class AcousticLightningModule(BaseLightningModule):
             self.vocoder.to(self.device)
 
     def register_losses_and_metrics(self) -> None:
+        self.use_alf = self.model_config.use_alf
         if self.model_config.spec_decoder.use_shallow_diffusion:
             aux_loss_type = self.training_config.loss.spec_decoder.aux_loss_type
             if aux_loss_type == "L1":
@@ -45,6 +58,9 @@ class AcousticLightningModule(BaseLightningModule):
             log_norm=self.training_config.loss.spec_decoder.main_loss_log_norm
         )
         self.register_loss("diff_spec_loss", diff_spec_loss)
+        if self.use_alf:
+            self.register_loss("alf_ctc_loss", AttentionCTCLoss())
+            self.register_loss("alf_bin_loss", AttentionBinarizationLoss())
 
     def forward_model(self, sample: dict[str, torch.Tensor], infer: bool) -> dict[str, torch.Tensor]:
         tokens = sample["tokens"]
@@ -58,13 +74,16 @@ class AcousticLightningModule(BaseLightningModule):
         variances = {v_name: sample[v_name] for v_name in self.model_config.embeddings.embedded_variance_names}
         model_out, mask = self.model(
             tokens=tokens, durations=durations, languages=languages, spk_ids=spk_id,
-            f0=f0, key_shift=key_shift, speed=speed, spec_gt=mel, infer=infer, **variances
+            f0=f0, key_shift=key_shift, speed=speed, spec_gt=mel, infer=infer,
+            needs_alignment=sample.get("needs_alignment"), mel_lengths=sample.get("mel_length"),
+            **variances
         )
         model_out: ShallowDiffusionOutput
         if infer:
             outputs = {
                 "aux_spec": model_out.aux_out,
                 "diff_spec": model_out.diff_out,
+                "alf": model_out.alf_out,
             }
             return outputs
         else:
@@ -75,6 +94,16 @@ class AcousticLightningModule(BaseLightningModule):
             v_pred, v_gt, t = model_out.diff_out
             diff_spec_loss = self.losses["diff_spec_loss"](v_pred, v_gt, t=t, non_padding=mask.unsqueeze(-1).to(t))
             losses["diff_spec_loss"] = diff_spec_loss
+            if self.use_alf and model_out.alf_out is not None:
+                needs_alignment = sample.get("needs_alignment")
+                if needs_alignment is not None and needs_alignment.any():
+                    attn_softs, attn_hards, attn_logprobs, token_lengths, mel_lengths = model_out.alf_out
+                    losses["alf_ctc_loss"] = self.losses["alf_ctc_loss"](
+                        attn_logprobs, token_lengths, mel_lengths
+                    ) * self.training_config.loss.spec_decoder.lambda_alf_ctc
+                    losses["alf_bin_loss"] = self.losses["alf_bin_loss"](
+                        attn_hards, attn_softs
+                    ) * self.training_config.loss.spec_decoder.lambda_alf_bin
             return losses
 
     def plot_validation_results(self, sample: dict[str, torch.Tensor], outputs: dict[str, torch.Tensor]) -> None:
@@ -113,6 +142,37 @@ class AcousticLightningModule(BaseLightningModule):
                 if self.vocoder is not None:
                     diff_wav = self.vocoder.run(outputs["diff_spec"][i].unsqueeze(0), f0=f0.unsqueeze(0)).squeeze(0)
                     self.plot_wav(f"waveform/diff_wav_{data_idx}", diff_wav)
+        if self.use_alf and (alf_out := outputs.get("alf")) is not None:
+            attn_softs, attn_hards, _, token_lengths, mel_lengths = alf_out
+            needs_alignment = sample.get("needs_alignment")
+            for i in range(len(sample["indices"])):
+                data_idx = sample["indices"][i].item()
+                if data_idx >= self.training_config.validation.max_plots:
+                    continue
+                if needs_alignment is None or not bool(needs_alignment[i].item()):
+                    continue
+                token_len = token_lengths[i].item()
+                mel_len = mel_lengths[i].item()
+                soft = attn_softs[i, 0, :mel_len, :token_len]
+                hard = attn_hards[i, 0, :mel_len, :token_len]
+                spk_name = self.valid_dataset.info["spk_names"][data_idx]
+                item_name = self.valid_dataset.info["item_names"][data_idx]
+                title = f"{spk_name} - {item_name}"
+                if self.model_config.alf_use_interleaved_pad and "ph_texts" in self.valid_dataset.info:
+                    ph_seq = [self.model_config.alf_pad_phoneme]
+                    for ph in self.valid_dataset.info["ph_texts"][data_idx].split():
+                        ph_seq.extend([ph, self.model_config.alf_pad_phoneme])
+                elif "ph_texts" in self.valid_dataset.info:
+                    ph_seq = self.valid_dataset.info["ph_texts"][data_idx].split()
+                else:
+                    ph_seq = None
+                self.plot_alf(
+                    tag=f"alignment/alf_{data_idx}",
+                    attn_soft=soft,
+                    attn_hard=hard,
+                    ph_seq=ph_seq,
+                    title=title
+                )
 
     def plot_spec(self, tag: str, spec_gt: torch.Tensor, spec_pred: torch.Tensor, title=None):
         vmin = self.training_config.validation.spec_vmin
@@ -128,4 +188,11 @@ class AcousticLightningModule(BaseLightningModule):
         logger.experiment.add_audio(
             tag, wav.cpu().numpy(),
             sample_rate=self.vocoder.sample_rate, global_step=self.global_step
+        )
+
+    def plot_alf(self, tag: str, attn_soft: torch.Tensor, attn_hard: torch.Tensor, ph_seq=None, title=None):
+        logger: TensorBoardLogger = self.logger
+        logger.experiment.add_figure(
+            tag, alf_to_figure(attn_soft, attn_hard, ph_seq=ph_seq, title=title),
+            global_step=self.global_step
         )

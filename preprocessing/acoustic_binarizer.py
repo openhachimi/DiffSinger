@@ -16,7 +16,9 @@ ACOUSTIC_ITEM_ATTRIBUTES = [
     "languages",
     "tokens",
     "ph_dur",
+    "needs_alignment",
     "mel",
+    "mel_length",
     "f0",
     "energy",
     "breathiness",
@@ -36,6 +38,21 @@ class AcousticBinarizer(BaseBinarizer):
     __data_attrs__ = ACOUSTIC_ITEM_ATTRIBUTES
     __augmentation__ = True
 
+    def __init__(self, data_config, binarizer_config, coverage_check_option="strict"):
+        super().__init__(data_config, binarizer_config, coverage_check_option=coverage_check_option)
+        self.use_alf = bool(getattr(self.config, "use_alf", False))
+        self.force_alf_alignment_by_spk = {}
+        for source in self.sources:
+            force_alf_alignment = bool(getattr(source, "force_alf_alignment", False))
+            if source.speaker in self.force_alf_alignment_by_spk and \
+                    self.force_alf_alignment_by_spk[source.speaker] != force_alf_alignment:
+                raise ValueError(
+                    f"Inconsistent force_alf_alignment settings for speaker '{source.speaker}'."
+                )
+            self.force_alf_alignment_by_spk[source.speaker] = force_alf_alignment
+        if any(self.force_alf_alignment_by_spk.values()) and not self.use_alf:
+            raise ValueError("datasets[].force_alf_alignment requires binarizer.use_alf/model.use_alf to be true.")
+
     def load_metadata(self, data_source_config: DataSourceConfig):
         metadata_dict = collections.OrderedDict()
         raw_data_dir = data_source_config.raw_data_dir_resolved
@@ -46,7 +63,8 @@ class AcousticBinarizer(BaseBinarizer):
             spk_name = data_source_config.speaker
             spk_id = data_source_config.spk_id
             succeeded, parse_results = self.parse_language_phoneme_sequences(
-                transcription, language=data_source_config.language
+                transcription, language=data_source_config.language,
+                allow_none_ph_dur=self.use_alf
             )
             if not succeeded:
                 raise ValueError(
@@ -61,7 +79,7 @@ class AcousticBinarizer(BaseBinarizer):
                 )
             metadata_dict[item_name] = AcousticMetadataItem(
                 item_name=item_name,
-                estimated_duration=sum(ph_dur),
+                estimated_duration=sum(ph_dur) if ph_dur is not None else 0.0,
                 spk_name=spk_name,
                 spk_id=spk_id,
                 ph_text=ph_text,
@@ -75,8 +93,20 @@ class AcousticBinarizer(BaseBinarizer):
     def process_item(self, item: AcousticMetadataItem, augmentation=False) -> list[DataSample]:
         waveform = self.load_waveform(item.wav_fn)
         mel, length = self.get_mel(waveform)
-        ph_dur_sec = numpy.array(item.ph_dur, dtype=numpy.float32)
-        ph_dur = self.sec_dur_to_frame_dur(ph_dur_sec, length)
+        force_alf_alignment = bool(self.force_alf_alignment_by_spk.get(item.spk_name, False))
+        use_alf_alignment = force_alf_alignment or item.ph_dur is None
+        if item.ph_dur is None and not force_alf_alignment:
+            if not self.use_alf:
+                raise ValueError("Found ph_dur=none but ALF alignment is disabled.")
+        if item.ph_dur is None:
+            ph_dur = numpy.zeros(len(item.ph_seq), dtype=numpy.int64)
+            ph_dur_sec = None
+        else:
+            ph_dur_sec = numpy.array(item.ph_dur, dtype=numpy.float32)
+            if use_alf_alignment:
+                ph_dur = numpy.zeros(len(item.ph_seq), dtype=numpy.int64)
+            else:
+                ph_dur = self.sec_dur_to_frame_dur(ph_dur_sec, length)
         f0, uv = self.get_f0(waveform, length)
         energy = self.get_energy(waveform, length, smooth_fn_name="energy")
         harmonic, noise = self.harmonic_noise_separation(waveform, f0)
@@ -90,7 +120,9 @@ class AcousticBinarizer(BaseBinarizer):
             "languages": numpy.array(item.lang_seq, dtype=numpy.int64),
             "tokens": numpy.array(item.ph_seq, dtype=numpy.int64),
             "ph_dur": ph_dur,
+            "needs_alignment": numpy.array(use_alf_alignment, dtype=numpy.bool_),
             "mel": mel,
+            "mel_length": numpy.array(length, dtype=numpy.int64),
             "f0": f0,
             "key_shift": numpy.array(0., dtype=numpy.float32),
             "speed": numpy.array(1., dtype=numpy.float32),
@@ -121,7 +153,7 @@ class AcousticBinarizer(BaseBinarizer):
         )
 
         samples = [sample]
-        if error or not augmentation:
+        if error or not augmentation or use_alf_alignment:
             return samples
 
         augmentation_params: list[tuple[float, float]] = []  # (shift, speed)
@@ -173,6 +205,7 @@ class AcousticBinarizer(BaseBinarizer):
             data_transform = sample.data.copy()
             data_transform["ph_dur"] = ph_dur_transform
             data_transform["mel"] = mel_transform
+            data_transform["mel_length"] = numpy.array(length_transform, dtype=numpy.int64)
             data_transform["f0"] = f0_transform
             data_transform["key_shift"] = numpy.array(shift, dtype=numpy.float32)
             data_transform["speed"] = (

@@ -422,6 +422,18 @@ The name of speaker of this dataset. Speaker names are mapped to speaker indexes
 <tr><td align="center"><b>type</b></td><td>str</td>
 </tbody></table>
 
+### datasets[].force_alf_alignment
+
+Whether to force automatic ALF alignment for this speaker in acoustic preprocessing, even when `ph_dur` is not `none`.
+
+<table><tbody>
+<tr><td align="center"><b>visibility</b></td><td>acoustic</td>
+<tr><td align="center"><b>scope</b></td><td>preprocessing</td>
+<tr><td align="center"><b>customizability</b></td><td>recommended</td>
+<tr><td align="center"><b>type</b></td><td>bool</td>
+<tr><td align="center"><b>default</b></td><td>false</td>
+</tbody></table>
+
 ### datasets[].spk_id
 
 The speaker ID assigned to this dataset. Will be automatically assigned if not given. IDs can be duplicate or discontinuous to merge multiple datasets to one speaker.
