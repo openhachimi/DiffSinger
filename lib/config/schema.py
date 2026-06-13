@@ -534,6 +534,18 @@ class ModelConfig(ConfigBaseModel):
     alf_pad_phoneme: str = Field("SP", json_schema_extra={
         "scope": ConfigurationScope.ACOUSTIC
     })
+    use_bbc_encoder: bool = Field(False, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
+    bbc_mask_len: int = Field(8, gt=0, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
+    bbc_min_segment_length: int = Field(16, gt=0, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
+    bbc_mask_prob: float = Field(1.0, ge=0.0, le=1.0, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
     linguistic_encoder: LinguisticEncoderConfig = Field(...)
     melody_encoder: MelodyEncoderConfig = Field(None, json_schema_extra={
         "scope": ConfigurationScope.VARIANCE,
