@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from lib.config.schema import ModelConfig
 from .alignment import AlignmentLearningFramework, BetaBinomialInterpolator
+from .bbc_mask import fast_fast_bbc_mask
 from .commons.common_layers import (
     NormalInitEmbedding as Embedding,
     XavierUniformInitLinear as Linear,
@@ -55,6 +56,12 @@ class DiffSingerAcoustic(nn.Module):
                 )
         else:
             self.alf_use_interleaved_pad = False
+        self.use_bbc_encoder = config.use_bbc_encoder
+        if self.use_bbc_encoder:
+            self.bbc_mask_emb = nn.Parameter(torch.randn(1, 1, config.condition_dim))
+            self.bbc_mask_len = config.bbc_mask_len
+            self.bbc_min_segment_length = config.bbc_min_segment_length
+            self.bbc_mask_prob = config.bbc_mask_prob
 
     @staticmethod
     def _expand_tokens_for_alf(tokens, needs_alignment, pad_token_id, languages=None):
@@ -143,6 +150,45 @@ class DiffSingerAcoustic(nn.Module):
                 priors[b, :mel_len, :token_len] = torch.from_numpy(prior).to(device)
         return priors
 
+    def _upsample(self, encoder_out, durations):
+        """Upsample encoder output from phoneme to frame level.
+
+        When use_bbc_encoder is True, inserts a learnable blur-boundary token
+        at encoder position 1 and replaces the tail frames of each phoneme
+        segment with that token before gathering, so the model must infer the
+        exact phoneme boundary from context.  The ``durations`` passed here
+        should already reflect ALF-predicted values when ALF is active,
+        satisfying the requirement to use the ALF output as the bbc_encoder
+        ph_dur input.
+        """
+        if self.use_bbc_encoder:
+            # Compute frame-level phoneme indices from durations
+            mel2ph = self.local_upsample.lr(durations)  # [B, T_mel]
+            # Apply BBC mask: shift non-padding indices by +1 and replace
+            # tail frames of long-enough segments with index 1 (bbc_mask_emb)
+            mel2ph = fast_fast_bbc_mask(
+                mel2ph,
+                mask_length=self.bbc_mask_len,
+                min_segment_length=self.bbc_min_segment_length,
+                mask_prob=self.bbc_mask_prob,
+            )
+            # Build augmented encoder output:
+            # position 0: zero padding  (for mel2ph == 0)
+            # position 1: bbc_mask_emb  (for BBC-masked boundary frames)
+            # position 2+: phoneme encodings
+            bbc_emb = self.bbc_mask_emb.expand(encoder_out.shape[0], 1, encoder_out.shape[-1])
+            encoder_out_bbc = F.pad(
+                torch.cat([bbc_emb, encoder_out], dim=1),
+                [0, 0, 1, 0],
+            )  # [B, T_ph+2, H]
+            # Gather frame-level representations
+            H = encoder_out_bbc.shape[-1]
+            mel2ph_idx = mel2ph.unsqueeze(-1).expand(-1, -1, H)
+            cond = torch.gather(encoder_out_bbc, 1, mel2ph_idx)
+            mask = mel2ph > 0
+            return cond, mask
+        return self.local_upsample(encoder_out, ups=durations)
+
     def forward(
             self, tokens, durations, languages, f0, spk_ids=None,
             spk_embed=None, spec_gt=None, infer=True,
@@ -191,7 +237,7 @@ class DiffSingerAcoustic(nn.Module):
             alf_out = (attn_softs, attn_hards, attn_logprobs, token_lengths, mel_lengths)
         else:
             encoder_out = self.linguistic_encoder(tokens=tokens, durations=durations, languages=languages)
-        cond, mask = self.local_upsample(encoder_out, ups=durations)
+        cond, mask = self._upsample(encoder_out, durations)
         if self.use_spk_embed:
             if spk_embed is None:
                 spk_embed = self.speaker_embedding(spk_ids)[:, None, :]
