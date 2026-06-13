@@ -6,6 +6,7 @@ from modules.commons.common_layers import (
     NormalInitEmbedding as Embedding,
     XavierUniformInitLinear as Linear,
 )
+from modules.fastspeech.bbc_mask import fast_fast_bbc_mask
 from modules.fastspeech.tts_modules import FastSpeech2Encoder, mel2ph_to_dur
 from utils.hparams import hparams
 from utils.phoneme_utils import PAD_INDEX
@@ -61,6 +62,13 @@ class FastSpeech2Acoustic(nn.Module):
         if self.use_spk_id:
             self.spk_embed = Embedding(hparams['num_spk'], hparams['hidden_size'])
 
+        self.use_bbc_encoder = hparams.get('use_bbc_encoder', False)
+        if self.use_bbc_encoder:
+            self.bbc_mask_len = hparams['bbc_mask_len']
+            self.bbc_min_segment_length = hparams['bbc_min_segment_length']
+            self.bbc_mask_prob = hparams['bbc_mask_prob']
+            self.bbc_mask_emb = nn.Parameter(torch.randn(1, 1, hparams['hidden_size']))
+
     def forward_variance_embedding(self, condition, key_shift=None, speed=None, **variances):
         if self.use_variance_embeds:
             variance_embeds = torch.stack([
@@ -112,7 +120,22 @@ class FastSpeech2Acoustic(nn.Module):
         Returns:
             condition: [B, T_mel, H]
         """
-        encoder_out = F.pad(encoder_out, [0, 0, 1, 0])
+        if self.use_bbc_encoder:
+            # Prepend bbc_mask_emb at position 1 then zero-pad at position 0.
+            # Layout after padding: [zero, bbc_mask_emb, ph_1, ph_2, ...]
+            # fast_fast_bbc_mask shifts non-zero mel2ph by +1 and sets boundary
+            # regions to 1 (pointing to bbc_mask_emb).
+            bbc_emb = self.bbc_mask_emb.expand(encoder_out.shape[0], 1, encoder_out.shape[-1])
+            encoder_out = torch.cat([bbc_emb, encoder_out], dim=1)
+            encoder_out = F.pad(encoder_out, [0, 0, 1, 0])
+            mel2ph = fast_fast_bbc_mask(
+                mel2ph,
+                mask_length=self.bbc_mask_len,
+                min_segment_length=self.bbc_min_segment_length,
+                mask_prob=self.bbc_mask_prob
+            )
+        else:
+            encoder_out = F.pad(encoder_out, [0, 0, 1, 0])
         mel2ph_ = mel2ph[..., None].repeat([1, 1, encoder_out.shape[-1]])
         condition = torch.gather(encoder_out, 1, mel2ph_)
 
