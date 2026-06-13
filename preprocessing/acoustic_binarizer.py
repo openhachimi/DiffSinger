@@ -4,7 +4,6 @@ import csv
 import random
 from dataclasses import dataclass
 
-import dask
 import numpy
 
 from lib.config.schema import DataSourceConfig
@@ -135,8 +134,6 @@ class AcousticBinarizer(BaseBinarizer):
             data["voicing"] = voicing
         if self.config.features.tension.enabled:
             data["tension"] = tension
-        length, uv, data = dask.compute(length, uv, data)
-
         if uv.all():
             error = "empty gt f0"
         else:
@@ -197,9 +194,9 @@ class AcousticBinarizer(BaseBinarizer):
         for shift, speed in augmentation_params:
             mel_transform, length_transform = self.get_mel(waveform, shift=shift, speed=speed)
             ph_dur_transform = self.sec_dur_to_frame_dur(ph_dur_sec / speed, length_transform)
-            f0_transform = dask.delayed(resize_curve)(data["f0"] * 2 ** (shift / 12), length_transform)
+            f0_transform = resize_curve(data["f0"] * 2 ** (shift / 12), length_transform)
             v_transform = {
-                v_name: dask.delayed(resize_curve)(data[v_name], length_transform)
+                v_name: resize_curve(data[v_name], length_transform)
                 for v_name in self.config.features.enabled_variance_names
             }
             data_transform = sample.data.copy()
@@ -208,17 +205,12 @@ class AcousticBinarizer(BaseBinarizer):
             data_transform["mel_length"] = numpy.array(length_transform, dtype=numpy.int64)
             data_transform["f0"] = f0_transform
             data_transform["key_shift"] = numpy.array(shift, dtype=numpy.float32)
-            data_transform["speed"] = (
-                dask.delayed(
-                    lambda x: numpy.array(sample.length / x, dtype=numpy.float32)  # real speed
-                )(length_transform)
-            )
+            data_transform["speed"] = numpy.array(sample.length / length_transform, dtype=numpy.float32)
             for v_name in self.config.features.enabled_variance_names:
                 data_transform[v_name] = v_transform[v_name]
             length_transforms.append(length_transform)
             data_transforms.append(data_transform)
 
-        length_transforms, data_transforms = dask.compute(length_transforms, data_transforms)
         for i in range(len(augmentation_params)):
             sample_transform = copy.copy(sample)
             sample_transform.length = length_transforms[i]

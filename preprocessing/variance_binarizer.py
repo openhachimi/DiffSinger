@@ -2,7 +2,6 @@ import collections
 import csv
 from dataclasses import dataclass
 
-import dask
 import librosa
 import numpy
 import scipy
@@ -227,10 +226,10 @@ class VarianceBinarizer(BaseBinarizer):
             label, "f0_seq", "f0_timestep", length
         )
         if f0 is not None:
-            f0, uv = dask.delayed(lambda f: interp_f0(f, f == 0), nout=2)(f0)
+            f0, uv = interp_f0(f0, f0 == 0)
         else:
             f0, uv = self.get_f0(waveform, length)
-        pitch = dask.delayed(librosa.hz_to_midi)(f0)
+        pitch = librosa.hz_to_midi(f0)
         if self.config.midi.enabled:
             note_rest = numpy.array(item.note_rest, dtype=bool)
             note_midi = self.interp_midi(numpy.array(item.note_midi, dtype=numpy.float32), note_rest)
@@ -287,8 +286,6 @@ class VarianceBinarizer(BaseBinarizer):
             data["voicing"] = voicing
         if self.config.features.tension.enabled:
             data["tension"] = tension
-        uv, data = dask.compute(uv, data)
-
         if uv.all():
             error = "empty gt f0"
         else:
@@ -307,7 +304,6 @@ class VarianceBinarizer(BaseBinarizer):
         # No augmentation supported yet
         return [sample]
 
-    @dask.delayed
     def interp_midi(self, note_midi: numpy.ndarray, note_rest: numpy.ndarray):
         interp_func = scipy.interpolate.interp1d(
             numpy.where(~note_rest)[0], note_midi[~note_rest],
@@ -316,7 +312,6 @@ class VarianceBinarizer(BaseBinarizer):
         note_midi[note_rest] = interp_func(numpy.where(note_rest)[0])
         return note_midi
 
-    @dask.delayed
     def get_base_pitch(self, note_midi: numpy.ndarray, note_dur: numpy.ndarray):
         with torch.no_grad():
             mel2note = self.lr(torch.from_numpy(note_dur).to(self.device)[None])[0].cpu().numpy()

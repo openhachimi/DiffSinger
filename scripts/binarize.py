@@ -7,7 +7,6 @@ os.environ["PYTHONPATH"] = str(root_dir)
 sys.path.insert(0, str(root_dir))
 
 import click
-import dask
 
 from lib import logging
 from lib.config.formatter import format_model
@@ -17,9 +16,6 @@ from lib.config.schema import RootConfig, DataConfig, BinarizerConfig, Configura
 __all__ = [
     "binarize_datasets",
 ]
-
-dask.config.set(scheduler="synchronous")
-
 
 def _load_and_log_config(config_path: pathlib.Path, scope: int, overrides: list[str] = None) -> RootConfig:
     config = load_raw_config(config_path, overrides)
