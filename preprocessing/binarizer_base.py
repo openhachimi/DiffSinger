@@ -4,7 +4,6 @@ import pathlib
 from dataclasses import dataclass
 from typing import Literal
 
-import dask
 import librosa
 import numpy
 import torch
@@ -408,12 +407,10 @@ class BaseBinarizer(abc.ABC):
         self.process_items(self.valid_items, prefix="valid", augmentation=False, multiprocessing=False)
         self.process_items(self.train_items, prefix="train", augmentation=self.__augmentation__, multiprocessing=True)
 
-    @dask.delayed
     def load_waveform(self, wav_fn: pathlib.Path):
         waveform, _ = librosa.load(wav_fn, sr=self.config.features.audio_sample_rate, mono=True)
         return waveform
 
-    @dask.delayed(nout=2)
     @torch.no_grad()
     def get_mel(self, waveform: numpy.ndarray, shift: float = 0., speed: float = 1.):
         if self.mel_spec is None:
@@ -432,7 +429,6 @@ class BaseBinarizer(abc.ABC):
         ).squeeze(0).T.cpu().numpy()
         return mel, mel.shape[0]
 
-    @dask.delayed
     def sec_dur_to_frame_dur(self, dur_sec: numpy.ndarray, length: int):
         dur_cumsum = numpy.round(numpy.cumsum(dur_sec, axis=0) / self.timestep + 0.5).astype(numpy.int64)
         dur_cumsum = numpy.clip(dur_cumsum, a_min=0, a_max=length)
@@ -448,7 +444,6 @@ class BaseBinarizer(abc.ABC):
             ).eval().to(self.device)
         return self.smooth_fns[smooth_fn_name](torch.from_numpy(curve)[None].to(self.device))[0].cpu().numpy()
 
-    @dask.delayed(nout=2)
     def get_f0(self, waveform: numpy.ndarray, length: int):
         pe_method = self.config.extractors.pitch_extraction.method
         if pe_method == "parselmouth":
@@ -488,7 +483,6 @@ class BaseBinarizer(abc.ABC):
             raise ValueError(f"Unknown pitch extraction method: {pe_method}")
         return f0, uv
 
-    @dask.delayed
     def get_energy(self, waveform: numpy.ndarray, length: int, smooth_fn_name: str = None):
         energy = get_energy(
             waveform, length,
@@ -499,7 +493,6 @@ class BaseBinarizer(abc.ABC):
             energy = self.smooth_curve(energy, smooth_fn_name=smooth_fn_name)
         return energy
 
-    @dask.delayed(nout=2)
     def world_analyze(self, waveform: numpy.ndarray, f0: numpy.ndarray):
         sp, ap = world_analyze(
             waveform, f0,
@@ -509,7 +502,6 @@ class BaseBinarizer(abc.ABC):
         )
         return sp, ap
 
-    @dask.delayed
     def world_synthesize_aperiodic(self, f0: numpy.ndarray, sp: numpy.ndarray, ap: numpy.ndarray):
         noise = world_synthesize_aperiodic(
             f0, sp, ap,
@@ -518,7 +510,6 @@ class BaseBinarizer(abc.ABC):
         )
         return noise
 
-    @dask.delayed
     def world_synthesize_harmonics(self, f0: numpy.ndarray, sp: numpy.ndarray, ap: numpy.ndarray):
         harmonic = world_synthesize_harmonics(
             f0, sp, ap,
@@ -527,7 +518,6 @@ class BaseBinarizer(abc.ABC):
         )
         return harmonic
 
-    @dask.delayed(nout=2)
     @torch.no_grad()
     def run_vr_separation(self, waveform: numpy.ndarray):
         if self.hn_sep_model is None:
@@ -557,7 +547,6 @@ class BaseBinarizer(abc.ABC):
             raise ValueError(f"Unknown harmonic-noise separation method: {hn_sep_method}")
         return harmonic, noise
 
-    @dask.delayed
     def get_kth_harmonic(self, harmonic: numpy.ndarray, f0: numpy.ndarray, k: int):
         kth_harmonic = get_kth_harmonic(
             harmonic, f0, k=k,
@@ -568,7 +557,6 @@ class BaseBinarizer(abc.ABC):
         )
         return kth_harmonic
 
-    @dask.delayed
     def get_tension(self, harmonic: numpy.ndarray, base_harmonic: numpy.ndarray, length: numpy.ndarray):
         tension = get_tension(
             harmonic, base_harmonic, length,
@@ -584,7 +572,7 @@ class BaseBinarizer(abc.ABC):
         curve_text = label.get(curve_key)
         if curve_text is None:
             return None
-        curve = dask.delayed(resample_align_curve)(
+        curve = resample_align_curve(
             numpy.array(curve_text.split(), numpy.float32),
             original_timestep=float(label[timestep_key]),
             target_timestep=self.timestep,

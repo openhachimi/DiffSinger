@@ -2,7 +2,6 @@ import collections
 import csv
 from dataclasses import dataclass
 
-import dask
 import librosa
 import numpy
 import torch
@@ -101,10 +100,10 @@ class DurationBinarizer(BaseBinarizer):
             label, "f0_seq", "f0_timestep", length
         )
         if f0 is not None:
-            f0, uv = dask.delayed(lambda f: interp_f0(f, f == 0), nout=2)(f0)
+            f0, uv = interp_f0(f0, f0 == 0)
         else:
             f0, uv = self.get_f0(waveform, length)
-        pitch = dask.delayed(librosa.hz_to_midi)(f0)
+        pitch = librosa.hz_to_midi(f0)
         ph_midi = self.get_ph_midi(ph_dur, pitch)
 
         data = {
@@ -115,8 +114,6 @@ class DurationBinarizer(BaseBinarizer):
             "ph_midi": ph_midi,
             "ph2word": ph2word,
         }
-        uv, data = dask.compute(uv, data)
-
         if uv.all():
             error = "empty gt f0"
         else:
@@ -135,13 +132,11 @@ class DurationBinarizer(BaseBinarizer):
         # No augmentation supported yet
         return [sample]
 
-    @dask.delayed
     def get_ph2word(self, ph_num: numpy.ndarray):
         ph_num = torch.from_numpy(ph_num).to(self.device)[None]
         ph2word = self.lr(ph_num)
         return ph2word[0].cpu().numpy()
 
-    @dask.delayed
     def get_ph_midi(self, ph_dur: numpy.ndarray, pitch: numpy.ndarray):
         with torch.no_grad():
             mel2ph = self.lr(torch.from_numpy(ph_dur).to(self.device)[None])[0].cpu().numpy()

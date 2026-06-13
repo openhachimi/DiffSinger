@@ -136,7 +136,11 @@ class DiffSingerAcoustic(nn.Module):
             real_mask = token_maps[b] > 0
             token_count = int(real_mask.sum().item())
             if token_count > 0:
-                durations_no_pad[b, :token_count] = durations[b, real_mask][:token_count]
+                recovered = durations.new_zeros((token_count,))
+                expanded_indices = torch.arange(token_maps.shape[1], device=durations.device)
+                collapse_indices = torch.clamp(expanded_indices // 2, max=token_count - 1)
+                recovered.scatter_add_(0, collapse_indices, durations[b, :token_maps.shape[1]])
+                durations_no_pad[b, :token_count] = recovered
         return durations_no_pad
 
     def _compute_attn_priors(self, mel_lengths, token_lengths, max_mel_len, max_token_len, device):
