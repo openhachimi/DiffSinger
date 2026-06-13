@@ -164,3 +164,56 @@ class PhonemeDictionary:
             ph_map = {k: v for k, v in ph_map.items() if k not in excludes}
         with open(filename, "w", encoding="utf8") as fp:
             json.dump(ph_map, fp, ensure_ascii=False, indent=2)
+
+
+class LoadedPhonemeDictionary:
+    def __init__(self, phone_to_id: dict[str, int]):
+        self._phone_to_id = phone_to_id
+        langs_by_id = {}
+        for phoneme, idx in phone_to_id.items():
+            if "/" in phoneme:
+                langs_by_id.setdefault(idx, set()).add(phoneme.split("/", maxsplit=1)[0])
+        self._cross_lingual_phonemes = frozenset({
+            phoneme
+            for phoneme, idx in phone_to_id.items()
+            if "/" in phoneme and len(langs_by_id.get(idx, set())) > 1
+        })
+
+    @property
+    def vocab_size(self):
+        return max(self._phone_to_id.values(), default=0) + 1
+
+    def __len__(self):
+        return self.vocab_size
+
+    def is_cross_lingual(self, phone):
+        return phone in self._cross_lingual_phonemes
+
+    def encode_one(self, phone, lang=None):
+        if "/" in phone:
+            return self._phone_to_id.get(phone)
+        if phone in self._phone_to_id:
+            return self._phone_to_id[phone]
+        if lang is None:
+            return None
+        return self._phone_to_id.get(f"{lang}/{phone}")
+
+    def encode(self, sentence, lang=None):
+        phones = sentence.strip().split() if isinstance(sentence, str) else sentence
+        return [self.encode_one(phone, lang=lang) for phone in phones]
+
+
+def load_phoneme_dictionary():
+    from utils.hparams import hparams
+
+    ph_map_path = pathlib.Path(hparams["work_dir"]) / "ph_map.json"
+    if ph_map_path.exists():
+        with open(ph_map_path, "r", encoding="utf8") as f:
+            ph_map = json.load(f)
+        return LoadedPhonemeDictionary(ph_map)
+    if (dictionaries := hparams.get("dictionaries")):
+        return PhonemeDictionary({
+            lang: pathlib.Path(dict_path)
+            for lang, dict_path in dictionaries.items()
+        })
+    raise FileNotFoundError(f'Phoneme map not found: {ph_map_path}')

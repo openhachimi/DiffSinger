@@ -4,7 +4,16 @@ import pathlib
 import re
 from collections import OrderedDict
 
-import torch
+def _extract_checkpoint_step(ckpt_name: str):
+    matched = re.search(r'(?:steps[=_])(\d+)', ckpt_name)
+    return None if matched is None else int(matched.group(1))
+
+
+def _is_checkpoint_file(ckpt_name: str):
+    return (
+        re.fullmatch(r'model_ckpt_steps_\d+\.ckpt', ckpt_name) is not None or
+        re.fullmatch(r'model-.*-steps=\d+-epochs=.*\.ckpt', ckpt_name) is not None
+    )
 
 
 def load_ckpt(
@@ -12,6 +21,8 @@ def load_ckpt(
         prefix_in_ckpt='model', ignored_prefixes=None, key_in_ckpt='state_dict',
         strict=True, device='cpu'
 ):
+    import torch
+
     if ignored_prefixes is None:
         # NOTICE: this is for compatibility with old checkpoints which have duplicate txt_embed layer in them.
         ignored_prefixes = ['model.fs2.encoder.embed_tokens']
@@ -20,16 +31,27 @@ def load_ckpt(
     if ckpt_base_dir.is_file():
         checkpoint_path = [ckpt_base_dir]
     elif ckpt_steps is not None:
-        checkpoint_path = [ckpt_base_dir / f'model_ckpt_steps_{int(ckpt_steps)}.ckpt']
+        checkpoint_path = sorted(
+            [
+                ckpt_file
+                for ckpt_file in ckpt_base_dir.iterdir()
+                if ckpt_file.is_file()
+                and _is_checkpoint_file(ckpt_file.name)
+                and _extract_checkpoint_step(ckpt_file.name) == int(ckpt_steps)
+            ],
+            key=lambda x: x.name
+        )
+        if len(checkpoint_path) == 0:
+            checkpoint_path = [ckpt_base_dir / f'model_ckpt_steps_{int(ckpt_steps)}.ckpt']
     else:
         base_dir = ckpt_base_dir
         checkpoint_path = sorted(
             [
                 ckpt_file
                 for ckpt_file in base_dir.iterdir()
-                if ckpt_file.is_file() and re.fullmatch(r'model_ckpt_steps_\d+\.ckpt', ckpt_file.name)
+                if ckpt_file.is_file() and _is_checkpoint_file(ckpt_file.name)
             ],
-            key=lambda x: int(re.search(r'\d+', x.name).group(0))
+            key=lambda x: (_extract_checkpoint_step(x.name), x.name)
         )
     assert len(checkpoint_path) > 0, f'| ckpt not found in {ckpt_base_dir}.'
     checkpoint_path = checkpoint_path[-1]

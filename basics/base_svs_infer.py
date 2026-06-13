@@ -27,7 +27,9 @@ class BaseSVSInfer:
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
-        self.timestep = hparams['hop_size'] / hparams['audio_sample_rate']
+        self.timestep = hparams.get('timestep')
+        if self.timestep is None:
+            self.timestep = hparams['hop_size'] / hparams['audio_sample_rate']
         self.spk_map = {}
         self.lang_map = {}
         self.model: torch.nn.Module = None

@@ -45,6 +45,7 @@ class DiffusionDecoder(nn.Module):
             backbone=(cls := BACKBONES[config.backbone_arch])(
                 sample_dim, condition_dim, **filter_kwargs_by_class(cls, config.backbone_kwargs)
             ),
+            t_start=config.t_start,
             time_scale_factor=config.time_scale_factor
         )
         self.sampling_algorithm = config.sampling_algorithm
