@@ -13,6 +13,7 @@ data:
     - raw_data_dir: "data/qixuan_v4/raw"
       speaker: qixuan
       spk_id: 0
+      force_alf_alignment: false
       language: zh
       test_prefixes:
         - "DongWuSenLin_021"
@@ -20,15 +21,18 @@ data:
     - raw_data_dir: "data/junninghua_v3_part1_glide/raw"
       speaker: junninghua
       spk_id: 1
+      force_alf_alignment: false
       language: zh
     - raw_data_dir: "data/junninghua_v3_part2_glide/raw"
       speaker: junninghua
       spk_id: 1
+      force_alf_alignment: false
       language: zh
 
 binarizer:
   binary_data_dir: "data/qixuan_v4/binary/acoustic"
   num_workers: 4
+  use_alf: false
   extractors:
     pitch_extraction:
       method: rmvpe
@@ -74,6 +78,9 @@ model:
   use_spk_id: true
   num_spk: 2
   condition_dim: 256
+  use_alf: false
+  alf_use_interleaved_pad: false
+  alf_pad_phoneme: SP
   linguistic_encoder:
     use_lang_id: true
     num_lang: 3
@@ -125,6 +132,8 @@ training:
       main_loss_type: L2
       main_loss_log_norm: false
       aux_loss_type: L1
+      lambda_alf_ctc: 1.0
+      lambda_alf_bin: 1.0
   dataloader:
     max_batch_frames: 50000
     max_batch_size: 48

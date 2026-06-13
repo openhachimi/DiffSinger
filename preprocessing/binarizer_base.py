@@ -36,7 +36,7 @@ class MetadataItem(abc.ABC):
     ph_text: str
     lang_seq: list[int]
     ph_seq: list[int]
-    ph_dur: list[float]
+    ph_dur: list[float] | None
     wav_fn: pathlib.Path
 
 
@@ -119,7 +119,9 @@ class BaseBinarizer(abc.ABC):
                 return True, transcription
         return False, transcription
 
-    def parse_language_phoneme_sequences(self, transcription: dict, language: str) -> tuple[bool, tuple | str]:
+    def parse_language_phoneme_sequences(
+            self, transcription: dict, language: str, allow_none_ph_dur: bool = False
+    ) -> tuple[bool, tuple | str]:
         """
         Parse the language and phoneme sequences from transcriptions
         :param transcription: dict
@@ -157,21 +159,25 @@ class BaseBinarizer(abc.ABC):
                 "Unrecognized phonemes found in raw dataset '{}':\n"
                 f"item '{{}}', phonemes {sorted(unrecognized_phs)}"
             )
-        ph_dur = []
-        for dur in transcription["ph_dur"].split():
-            dur_float = float(dur)
-            if dur_float < 0:
-                return False, (
-                    "Negative phoneme duration found in raw dataset '{}':\n"
-                    f"item '{{}}', duration '{dur}'"
-                )
-            ph_dur.append(dur_float)
+        ph_dur_raw = transcription["ph_dur"].strip()
+        if allow_none_ph_dur and ph_dur_raw.lower() == "none":
+            ph_dur = None
+        else:
+            ph_dur = []
+            for dur in ph_dur_raw.split():
+                dur_float = float(dur)
+                if dur_float < 0:
+                    return False, (
+                        "Negative phoneme duration found in raw dataset '{}':\n"
+                        f"item '{{}}', duration '{dur}'"
+                    )
+                ph_dur.append(dur_float)
         if len(ph_seq) == 0:
             return False, (
                 "Empty phoneme sequence found in raw dataset '{}':\n"
                 f"item '{{}}'"
             )
-        if len(ph_seq) != len(ph_dur):
+        if ph_dur is not None and len(ph_seq) != len(ph_dur):
             raise ValueError(
                 "Unaligned ph_seq and ph_dur found in raw dataset '{}':\n"
                 f"item '{{}}', ph_seq length {len(ph_seq)}, ph_dur length {len(ph_dur)}"

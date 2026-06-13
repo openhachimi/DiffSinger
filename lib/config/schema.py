@@ -56,6 +56,9 @@ class DataSourceConfig(ConfigBaseModel):
         )
     })
     test_prefixes: list[str] = Field([])
+    force_alf_alignment: bool = Field(False, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
 
     @property
     def raw_data_dir_resolved(self) -> pathlib.Path:
@@ -249,6 +252,13 @@ class BinarizerAugmentationConfig(ConfigBaseModel):
 class BinarizerConfig(ConfigBaseModel):
     binary_data_dir: str = Field(...)
     num_workers: int = Field(0, ge=0)
+    use_alf: bool = Field(False, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC,
+        "dynamic_check": DynamicCheck(
+            expr=this() == ref("model.use_alf"),
+            message="This value must be the same as model.use_alf."
+        )
+    })
     prefer_ds: bool = Field(False, json_schema_extra={
         "scope": ConfigurationScope.VARIANCE
     })
@@ -515,6 +525,15 @@ class ModelConfig(ConfigBaseModel):
         )
     })
     condition_dim: int = Field(256, gt=0)
+    use_alf: bool = Field(False, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
+    alf_use_interleaved_pad: bool = Field(False, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
+    alf_pad_phoneme: str = Field("SP", json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC
+    })
     linguistic_encoder: LinguisticEncoderConfig = Field(...)
     melody_encoder: MelodyEncoderConfig = Field(None, json_schema_extra={
         "scope": ConfigurationScope.VARIANCE,
@@ -557,6 +576,12 @@ class DiffusionLossConfig(ConfigBaseModel):
         "scope": ConfigurationScope.ACOUSTIC,
     })
     aux_loss_lambda: float = Field(0.1, gt=0, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC,
+    })
+    lambda_alf_ctc: float = Field(1.0, gt=0, json_schema_extra={
+        "scope": ConfigurationScope.ACOUSTIC,
+    })
+    lambda_alf_bin: float = Field(1.0, gt=0, json_schema_extra={
         "scope": ConfigurationScope.ACOUSTIC,
     })
 

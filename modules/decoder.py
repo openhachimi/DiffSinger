@@ -24,6 +24,7 @@ class ShallowDiffusionOutput:
     aux_out: torch.Tensor
     diff_out: torch.Tensor
     norm_gt: torch.Tensor = None
+    alf_out: tuple | None = None
 
 
 class DiffusionDecoder(nn.Module):
