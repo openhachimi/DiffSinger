@@ -302,6 +302,16 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
             # Replace mel2ph only for ALF items (keep GT mel2ph for annotated items)
             mel2ph = torch.where(needs_alignment[:, None], mel2ph_alf, mel2ph)
 
+            # When BBC encoder is enabled, re-run the encoder for ALF items using
+            # the ALF-derived durations so the dur_embed matches the learned alignment.
+            if self.fs2.use_bbc_encoder and needs_alignment.any():
+                dur_alf = mel2ph_to_dur(mel2ph_alf, txt_tokens.shape[1]).float()
+                dur_combined = dur_gt.clone()
+                dur_combined[needs_alignment] = dur_alf[needs_alignment]
+                encoder_out_for_gather = self.fs2.forward_encoder(
+                    txt_tokens, languages=languages, dur=dur_combined
+                )
+
             # Gather condition from shared encoder_out
             condition = self.fs2.forward_gather(
                 encoder_out_for_gather, mel2ph, f0,

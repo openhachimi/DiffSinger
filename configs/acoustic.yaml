@@ -58,6 +58,14 @@ use_tension_embed: false
 use_key_shift_embed: false
 use_speed_embed: false
 
+# Blurry Boundary Compensation (BBC) encoder
+# Randomly masks the end of phoneme segments in mel2ph during training to simulate
+# fuzzy phoneme boundaries, improving alignment robustness.
+use_bbc_encoder: false
+bbc_mask_len: 8
+bbc_min_segment_length: 16
+bbc_mask_prob: 1.
+
 diffusion_type: reflow
 time_scale_factor: 1000
 timesteps: 1000

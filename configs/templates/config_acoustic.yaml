@@ -55,6 +55,12 @@ use_tension_embed: false
 use_key_shift_embed: true
 use_speed_embed: true
 
+# Blurry Boundary Compensation (BBC) encoder
+# use_bbc_encoder: false
+# bbc_mask_len: 8
+# bbc_min_segment_length: 16
+# bbc_mask_prob: 1.
+
 # Alignment Learning Framework (ALF)
 use_alf: false
 # Insert a pad phoneme between every phoneme (including head/tail) during ALF,
