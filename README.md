@@ -8,11 +8,12 @@
 - [ ] 修复v3推理和导出部分
 - [ ] 生成hubert units特征以配合svc使用
 - [ ] 更好的lora微调
-- [ ] 
-- [ ] 
-- [ ] 
-- [ ] 
-- [ ] 
+- [ ] 留空
+- [ ] 留空
+- [ ] 留空
+- [ ] 留空
+- [ ] 留空
+##出自癞痢:
 [![arXiv](https://img.shields.io/badge/arXiv-Paper-<COLOR>.svg)](https://arxiv.org/abs/2105.02446)
 [![downloads](https://img.shields.io/github/downloads/openvpi/DiffSinger/total.svg)](https://github.com/openvpi/DiffSinger/releases)
 [![license](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/openvpi/DiffSinger/blob/main/LICENSE)
