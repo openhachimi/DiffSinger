@@ -1,4 +1,5 @@
 import matplotlib
+import numpy as np
 import torch
 import torch.distributions
 import torch.optim
@@ -10,6 +11,7 @@ from basics.base_dataset import BaseDataset
 from basics.base_task import BaseTask
 from basics.base_vocoder import BaseVocoder
 from modules.aux_decoder import build_aux_loss
+from modules.fastspeech.tts_modules import mel2ph_to_dur
 from modules.losses import DiffusionLoss, RectifiedFlowLoss
 from modules.toplevel import DiffSingerAcoustic, ShallowDiffusionOutput
 from modules.vocoders.registry import get_vocoder_cls
@@ -46,10 +48,20 @@ class AcousticDataset(BaseDataset):
         tokens = utils.collate_nd([s['tokens'] for s in samples], 0)
         f0 = utils.collate_nd([s['f0'] for s in samples], 0.0)
         mel2ph = utils.collate_nd([s['mel2ph'] for s in samples], 0)
+        mel2ph_gt = utils.collate_nd([
+            s.get(
+                'mel2ph_gt',
+                s['mel2ph']
+                if not s.get('needs_alignment', False)
+                else np.zeros_like(s['mel2ph'])
+            )
+            for s in samples
+        ], 0)
         mel = utils.collate_nd([s['mel'] for s in samples], 0.0)
         batch.update({
             'tokens': tokens,
             'mel2ph': mel2ph,
+            'mel2ph_gt': mel2ph_gt,
             'mel': mel,
             'f0': f0,
         })
@@ -70,6 +82,10 @@ class AcousticDataset(BaseDataset):
             batch['needs_alignment'] = torch.BoolTensor(
                 [bool(s.get('needs_alignment', False)) for s in samples]
             )
+            batch['has_gt_alignment'] = torch.BoolTensor([
+                bool(s.get('has_gt_alignment', not s.get('needs_alignment', False)))
+                for s in samples
+            ])
             batch['mel_lengths'] = torch.LongTensor([s['mel'].shape[0] for s in samples])
         return batch
 
@@ -152,8 +168,12 @@ class AcousticTask(BaseTask):
             self.alf_bin_loss = AttentionBinarizationLoss()
             self.lambda_alf_ctc = hparams.get('lambda_alf_ctc', 1.0)
             self.lambda_alf_bin = hparams.get('lambda_alf_bin', 1.0)
+            self.lambda_alf_gt_path = hparams.get('lambda_alf_gt_path', 2.0)
+            self.lambda_alf_gt_dur = hparams.get('lambda_alf_gt_dur', 0.2)
             self.register_validation_loss('alf_ctc_loss')
             self.register_validation_loss('alf_bin_loss')
+            self.register_validation_loss('alf_gt_path_loss')
+            self.register_validation_loss('alf_gt_dur_loss')
 
     def run_model(self, sample, infer=False, return_output=False):
         txt_tokens = sample['tokens']  # [B, T_ph]
@@ -177,6 +197,7 @@ class AcousticTask(BaseTask):
             languages = None
 
         needs_alignment = sample.get('needs_alignment') if self.use_alf else None
+        has_gt_alignment = sample.get('has_gt_alignment') if self.use_alf else None
         mel_lengths = sample.get('mel_lengths') if self.use_alf else None
 
         output: ShallowDiffusionOutput = self.model(
@@ -185,6 +206,7 @@ class AcousticTask(BaseTask):
             spk_embed_id=spk_embed_id, languages=languages,
             gt_mel=target, infer=infer,
             needs_alignment=needs_alignment,
+            has_gt_alignment=has_gt_alignment,
             mel_lengths=mel_lengths,
         )
 
@@ -226,15 +248,93 @@ class AcousticTask(BaseTask):
                     raise ValueError(f"Unknown diffusion type: {self.diffusion_type}")
                 losses['mel_loss'] = mel_loss
 
-            # ALF losses (only when any item in the batch needed alignment)
-            if output.alf_out is not None and needs_alignment is not None and needs_alignment.any():
+            # ALF losses are separated by supervision type.  Weak-label items
+            # use monotonic CTC/binarization objectives; precisely aligned
+            # items directly supervise the soft attention path and durations.
+            if output.alf_out is not None and needs_alignment is not None:
                 attn_softs, attn_hards, attn_logprobs, token_lengths, mel_lens = output.alf_out
-                alf_ctc = self.lambda_alf_ctc * self.alf_ctc_loss(
-                    attn_logprobs, token_lengths, mel_lens
-                )
-                alf_bin = self.lambda_alf_bin * self.alf_bin_loss(attn_hards, attn_softs)
-                losses['alf_ctc_loss'] = alf_ctc
-                losses['alf_bin_loss'] = alf_bin
+                if has_gt_alignment is None:
+                    has_gt_alignment = ~needs_alignment
+
+                weak_mask = needs_alignment & ~has_gt_alignment
+                if weak_mask.any():
+                    losses['alf_ctc_loss'] = self.lambda_alf_ctc * self.alf_ctc_loss(
+                        attn_logprobs[weak_mask], token_lengths[weak_mask], mel_lens[weak_mask]
+                    )
+                    losses['alf_bin_loss'] = self.lambda_alf_bin * self.alf_bin_loss(
+                        attn_hards[weak_mask], attn_softs[weak_mask]
+                    )
+
+                if hparams.get('alf_train_on_gt', True) and has_gt_alignment.any():
+                    gt_mask = has_gt_alignment
+                    mel2ph_gt = sample.get('mel2ph_gt', mel2ph)
+                    gt_token_idx = (mel2ph_gt - 1).clamp_min(0)
+                    expanded_gt_mask = (
+                        gt_mask & needs_alignment
+                        if hparams.get('alf_use_interleaved_pad', False)
+                        else torch.zeros_like(gt_mask)
+                    )
+                    if expanded_gt_mask.any():
+                        # Expanded sequence layout is [SP, ph1, SP, ph2, ...],
+                        # so original 1-based phone ids map to 0-based odd slots.
+                        gt_token_idx[expanded_gt_mask] = (
+                            mel2ph_gt[expanded_gt_mask] * 2 - 1
+                        ).clamp_min(0)
+                    path_prob = torch.gather(
+                        attn_softs.squeeze(1), 2, gt_token_idx.unsqueeze(-1)
+                    ).squeeze(-1)
+                    frame_idx = torch.arange(
+                        mel2ph_gt.shape[1], device=mel2ph_gt.device
+                    )[None]
+                    valid_gt_frames = (
+                        gt_mask[:, None]
+                        & (mel2ph_gt > 0)
+                        & (frame_idx < mel_lens[:, None])
+                    )
+                    if valid_gt_frames.any():
+                        losses['alf_gt_path_loss'] = self.lambda_alf_gt_path * (
+                            -torch.log(path_prob.clamp_min(1e-6))[valid_gt_frames].mean()
+                        )
+
+                    mel_valid = frame_idx < mel_lens[:, None]
+                    dur_soft = (
+                        attn_softs.squeeze(1) * mel_valid[:, :, None].to(attn_softs.dtype)
+                    ).sum(dim=1)
+                    dur_gt = torch.zeros_like(dur_soft)
+                    dur_gt_raw = mel2ph_to_dur(mel2ph_gt, txt_tokens.shape[1]).float()
+                    normal_gt_mask = gt_mask & ~expanded_gt_mask
+                    if normal_gt_mask.any():
+                        dur_gt[normal_gt_mask, :dur_gt_raw.shape[1]] = dur_gt_raw[normal_gt_mask]
+                    if expanded_gt_mask.any():
+                        for batch_idx in torch.where(expanded_gt_mask)[0].tolist():
+                            phone_count = max((int(token_lengths[batch_idx].item()) - 1) // 2, 0)
+                            expanded_token_idx = (
+                                torch.arange(phone_count, device=dur_gt.device) * 2 + 1
+                            )
+                            dur_gt[batch_idx, expanded_token_idx] = dur_gt_raw[
+                                batch_idx, :phone_count
+                            ]
+                    duration_scale = mel_lens.clamp_min(1).to(dur_soft.dtype)[:, None]
+                    token_idx = torch.arange(dur_soft.shape[1], device=dur_soft.device)[None]
+                    valid_gt_tokens = gt_mask[:, None] & (token_idx < token_lengths[:, None])
+                    if expanded_gt_mask.any():
+                        expanded_valid_tokens = valid_gt_tokens[expanded_gt_mask]
+                        expanded_valid_tokens &= (token_idx % 2 == 1).expand_as(expanded_valid_tokens)
+                        valid_gt_tokens[expanded_gt_mask] = expanded_valid_tokens
+                    if valid_gt_tokens.any():
+                        losses['alf_gt_dur_loss'] = self.lambda_alf_gt_dur * torch.nn.functional.smooth_l1_loss(
+                            (dur_soft / duration_scale)[valid_gt_tokens],
+                            (dur_gt / duration_scale)[valid_gt_tokens]
+                        )
+
+            if self.use_alf:
+                # Keep validation aggregators well-defined even when a split
+                # contains only one supervision type.
+                zero = target.new_zeros(())
+                losses.setdefault('alf_ctc_loss', zero)
+                losses.setdefault('alf_bin_loss', zero)
+                losses.setdefault('alf_gt_path_loss', zero)
+                losses.setdefault('alf_gt_dur_loss', zero)
 
             if return_output:
                 return losses, output
@@ -270,10 +370,15 @@ class AcousticTask(BaseTask):
             if self.use_alf and non_infer_output.alf_out is not None:
                 attn_softs, attn_hards, _, token_lengths, mel_lengths = non_infer_output.alf_out
                 needs_alignment = sample.get('needs_alignment')
+                has_gt_alignment = sample.get('has_gt_alignment')
                 for i in range(len(sample['indices'])):
                     data_idx = sample['indices'][i].item()
                     if data_idx < hparams['num_valid_plots']:
-                        if needs_alignment is None or needs_alignment[i]:
+                        if (
+                            needs_alignment is None
+                            or needs_alignment[i]
+                            or (has_gt_alignment is not None and has_gt_alignment[i])
+                        ):
                             t_len = token_lengths[i].item()
                             m_len = mel_lengths[i].item()
                             soft = attn_softs[i, 0, :m_len, :t_len]
@@ -281,7 +386,11 @@ class AcousticTask(BaseTask):
                             ph_seq = None
                             if 'ph_texts' in self.valid_dataset.metadata:
                                 ph_seq = self.valid_dataset.metadata['ph_texts'][data_idx].split()
-                                if hparams.get('alf_use_interleaved_pad', False):
+                                if (
+                                    hparams.get('alf_use_interleaved_pad', False)
+                                    and needs_alignment is not None
+                                    and needs_alignment[i]
+                                ):
                                     ph_seq = self._expand_alf_ph_seq_for_plot(ph_seq)
                             self.plot_alf(data_idx, soft, hard, ph_seq=ph_seq)
         return losses, sample['size']

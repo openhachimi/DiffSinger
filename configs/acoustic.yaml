@@ -153,3 +153,8 @@ alf_pad_phoneme: SP
 # Loss weights for the ALF CTC and binarization losses
 lambda_alf_ctc: 1.0
 lambda_alf_bin: 1.0
+# Directly train ALF on items that contain artificial/ground-truth ph_dur.
+# The alignment encoder receives zero durations, so GT timing cannot leak in.
+alf_train_on_gt: true
+lambda_alf_gt_path: 2.0
+lambda_alf_gt_dur: 0.2

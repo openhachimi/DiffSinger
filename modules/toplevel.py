@@ -217,20 +217,31 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
     def forward(
             self, txt_tokens, mel2ph, f0, key_shift=None, speed=None,
             spk_embed_id=None, languages=None, gt_mel=None, infer=True,
-            needs_alignment=None, mel_lengths=None, **kwargs
+            needs_alignment=None, has_gt_alignment=None, mel_lengths=None, **kwargs
     ) -> ShallowDiffusionOutput:
         """
         Args:
             needs_alignment: [B] bool tensor; True for items that need ALF-based alignment
+            has_gt_alignment: [B] bool tensor; True when an artificial/GT alignment is available
             mel_lengths: [B] int tensor; actual mel frame counts (required when needs_alignment is set)
         """
         alf_out = None
 
-        # Use ALF when there are items without duration annotations (training or validation)
+        if has_gt_alignment is None and needs_alignment is not None:
+            has_gt_alignment = ~needs_alignment
+
+        # Besides weak-label items, run ALF on precisely aligned samples during
+        # training so their GT paths can directly supervise the aligner.
+        train_alf_on_gt = (
+            not infer
+            and hparams.get('alf_train_on_gt', True)
+            and has_gt_alignment is not None
+            and has_gt_alignment.any()
+        )
         if (
             self.use_alf
             and needs_alignment is not None
-            and needs_alignment.any()
+            and (needs_alignment.any() or train_alf_on_gt)
             and gt_mel is not None
         ):
             token_maps = None
@@ -249,26 +260,13 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
                 mel_lengths = (mel2ph > 0).sum(dim=1)
                 mel_lengths = torch.clamp(mel_lengths, min=1)
 
-            # Compute dur for the encoder:
-            #   GT items  → use GT mel2ph to compute dur (preserves dur conditioning)
-            #   ALF items → use zero dur (alignment will be learned)
-            dur_gt = mel2ph_to_dur(mel2ph, txt_tokens.shape[1]).float()
-            if self.alf_use_interleaved_pad:
-                dur = txt_tokens_alf.new_zeros(txt_tokens_alf.shape, dtype=torch.float)
-                non_alf_mask = ~needs_alignment
-                if non_alf_mask.any():
-                    dur[non_alf_mask, :dur_gt.shape[1]] = dur_gt[non_alf_mask]
-            else:
-                dur = dur_gt * (~needs_alignment[:, None]).float()
-
-            # Single encoder pass
-            encoder_out = self.fs2.forward_encoder(txt_tokens_alf, languages=languages_alf, dur=dur)
-            if self.alf_use_interleaved_pad:
-                encoder_out_for_gather = self._recover_no_pad_encoder_out(
-                    encoder_out, token_maps, txt_tokens.shape[1]
-                )
-            else:
-                encoder_out_for_gather = encoder_out
+            # The alignment encoder must never see GT durations.  Otherwise
+            # supervised items leak the answer through dur_embed and produce
+            # deceptively good attention without learning acoustic boundaries.
+            align_dur = txt_tokens_alf.new_zeros(txt_tokens_alf.shape, dtype=torch.float)
+            align_encoder_out = self.fs2.forward_encoder(
+                txt_tokens_alf, languages=languages_alf, dur=align_dur
+            )
 
             # Compute beta-binomial attention priors
             max_mel_len = gt_mel.shape[1]
@@ -279,7 +277,7 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
 
             # Run ALF: obtain soft/hard alignments
             durations, attn_softs, attn_hards, attn_logprobs = self.alf(
-                token_embeddings=encoder_out.transpose(1, 2),  # [B, H, T_text]
+                token_embeddings=align_encoder_out.transpose(1, 2),  # [B, H, T_text]
                 encoding_lengths=token_lengths,
                 features=gt_mel.transpose(1, 2),               # [B, n_mel, T_mel]
                 feature_lengths=mel_lengths,
@@ -302,15 +300,12 @@ class DiffSingerAcoustic(CategorizedModule, ParameterAdaptorModule):
             # Replace mel2ph only for ALF items (keep GT mel2ph for annotated items)
             mel2ph = torch.where(needs_alignment[:, None], mel2ph_alf, mel2ph)
 
-            # When BBC encoder is enabled, re-run the encoder for ALF items using
-            # the ALF-derived durations so the dur_embed matches the learned alignment.
-            if self.fs2.use_bbc_encoder and needs_alignment.any():
-                dur_alf = mel2ph_to_dur(mel2ph_alf, txt_tokens.shape[1]).float()
-                dur_combined = dur_gt.clone()
-                dur_combined[needs_alignment] = dur_alf[needs_alignment]
-                encoder_out_for_gather = self.fs2.forward_encoder(
-                    txt_tokens, languages=languages, dur=dur_combined
-                )
+            # A separate acoustic pass always receives the final durations:
+            # GT for precise items and ALF-derived values for weak-label items.
+            dur_final = mel2ph_to_dur(mel2ph, txt_tokens.shape[1]).float()
+            encoder_out_for_gather = self.fs2.forward_encoder(
+                txt_tokens, languages=languages, dur=dur_final
+            )
 
             # Gather condition from shared encoder_out
             condition = self.fs2.forward_gather(

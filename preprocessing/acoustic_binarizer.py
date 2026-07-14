@@ -39,7 +39,9 @@ ACOUSTIC_ITEM_ATTRIBUTES = [
     'languages',
     'tokens',
     'mel2ph',
+    'mel2ph_gt',
     'needs_alignment',
+    'has_gt_alignment',
     'f0',
     'energy',
     'breathiness',
@@ -152,17 +154,28 @@ class AcousticBinarizer(BaseBinarizer):
         }
 
         force_alf_alignment = bool(meta_data.get('force_alf_alignment', False)) and hparams.get('use_alf', False)
-        if meta_data['ph_dur'] is not None and not force_alf_alignment:
-            # Ground-truth durations available: compute mel2ph normally
+        if meta_data['ph_dur'] is not None:
+            # Preserve ground-truth alignment even when ALF is forced.  The
+            # acoustic path may use ALF in that case, while the preserved GT
+            # path still provides direct supervision for the aligner.
             ph_dur = np.array(meta_data['ph_dur'], dtype=np.float32)
-            processed_input['mel2ph'] = get_mel2ph_torch(
+            mel2ph_gt = get_mel2ph_torch(
                 self.lr, torch.from_numpy(ph_dur), length, self.timestep, device=self.device
             ).cpu().numpy()
-            processed_input['needs_alignment'] = np.bool_(False)
+            processed_input['mel2ph_gt'] = mel2ph_gt
+            processed_input['has_gt_alignment'] = np.bool_(True)
+            if force_alf_alignment:
+                processed_input['mel2ph'] = np.zeros(length, dtype=np.int64)
+                processed_input['needs_alignment'] = np.bool_(True)
+            else:
+                processed_input['mel2ph'] = mel2ph_gt
+                processed_input['needs_alignment'] = np.bool_(False)
         else:
             # No duration annotation: alignment will be learned during training
             processed_input['mel2ph'] = np.zeros(length, dtype=np.int64)
+            processed_input['mel2ph_gt'] = np.zeros(length, dtype=np.int64)
             processed_input['needs_alignment'] = np.bool_(True)
+            processed_input['has_gt_alignment'] = np.bool_(False)
 
         # get ground truth f0
         global pitch_extractor

@@ -68,6 +68,10 @@ use_alf: false
 alf_use_interleaved_pad: false
 # Global phoneme tag used as the inserted pad when alf_use_interleaved_pad=true.
 alf_pad_phoneme: SP
+# Use precisely aligned datasets to supervise the shared ALF attention.
+alf_train_on_gt: true
+lambda_alf_gt_path: 2.0
+lambda_alf_gt_dur: 0.2
 
 augmentation_args:
   random_pitch_shifting:
